@@ -26,8 +26,12 @@ function logLine(text, kind = "") {
   div.className = "line " + kind;
   div.textContent = text;
   box.appendChild(div);
-  box.scrollTop = box.scrollHeight;
+  if ($("#logAutoScroll")?.checked) box.scrollTop = box.scrollHeight;
 }
+
+$("#btnClearLog").addEventListener("click", () => {
+  $("#logBox").innerHTML = "";
+});
 
 function classifyLog(line) {
   const l = line.toLowerCase();
@@ -88,7 +92,8 @@ $("#btnImport").addEventListener("click", async () => {
 
 // ──────────────────────── 触发注册 ────────────────────────
 
-let currentEs = null;
+const runStreams = new Map();
+const SSE_DISCONNECT_NOTICE_DELAY_MS = 3000;
 
 $("#btnRun").addEventListener("click", async () => {
   const email = $("#regEmail").value.trim();
@@ -120,16 +125,42 @@ $("#btnRun").addEventListener("click", async () => {
   }
 });
 
-function streamRun(runId) {
-  if (currentEs) { try { currentEs.close(); } catch (_) {} }
+function streamRun(runId, options = {}) {
+  const replace = options.replace !== false;
+  const prefix = options.prefix ? `[run ${runId.slice(0, 6)}] ` : "";
+  const updateStatus = options.updateStatus !== false;
+
+  if (runStreams.has(runId)) return;
+  if (replace) {
+    for (const existing of runStreams.values()) {
+      try { existing.close(); } catch (_) {}
+    }
+    runStreams.clear();
+  }
+
   const es = new EventSource(`/api/runs/${runId}/stream`);
-  currentEs = es;
+  runStreams.set(runId, es);
+  let reconnectNotified = false;
+  let reconnectNoticeTimer = null;
+
+  const clearReconnectNoticeTimer = () => {
+    if (reconnectNoticeTimer !== null) {
+      clearTimeout(reconnectNoticeTimer);
+      reconnectNoticeTimer = null;
+    }
+  };
+
+  es.onopen = () => {
+    clearReconnectNoticeTimer();
+    if (reconnectNotified) logLine(`${prefix}[client] 日志连接已恢复`, "ok");
+    reconnectNotified = false;
+  };
 
   es.addEventListener("log", (e) => {
     try {
       const d = JSON.parse(e.data);
       if (!d.line) return;
-      logLine(d.line, classifyLog(d.line));
+      logLine(prefix + d.line, classifyLog(d.line));
     } catch (_) {}
   });
 
@@ -140,22 +171,26 @@ function streamRun(runId) {
         const s = `✅ 注册完成: access_token=${d.access_token_len}${d.partial ? "  (部分凭证)" : ""}`;
         const buttons = [];
         if (d.access_token_len > 0)  buttons.push(`<button class="quick-copy" data-email="${d.email}" data-field="access_token">📋 复制 access_token</button>`);
-        $("#runStatus").innerHTML = `<span class="ok">${s}</span>${buttons.length ? "<br>" + buttons.join(" ") : ""}`;
-        logLine("[client] " + s, "evt");
+        if (updateStatus) $("#runStatus").innerHTML = `<span class="ok">${s}</span>${buttons.length ? "<br>" + buttons.join(" ") : ""}`;
+        logLine(prefix + "[client] " + s, "evt");
       } else if (d.kind === "error") {
-        $("#runStatus").textContent = "❌ " + d.message;
-        $("#runStatus").className = "result bad";
-        logLine("[client] ❌ " + d.message, "err");
+        if (updateStatus) {
+          $("#runStatus").textContent = "❌ " + d.message;
+          $("#runStatus").className = "result bad";
+        }
+        logLine(prefix + "[client] ❌ " + d.message, "err");
       } else if (d.kind === "phase") {
-        logLine(`[client] phase=${d.phase} email=${d.email}`, "evt");
+        const detail = d.message || (d.email ? `email=${d.email}` : "");
+        logLine(`${prefix}[client] phase=${d.phase}${detail ? " " + detail : ""}`, "evt");
       }
     } catch (_) {}
   });
 
   es.addEventListener("end", () => {
+    clearReconnectNoticeTimer();
     try { es.close(); } catch (_) {}
-    currentEs = null;
-    $("#btnRun").disabled = false;
+    runStreams.delete(runId);
+    if (updateStatus) $("#btnRun").disabled = false;
     refreshStats();
     refreshPool();
     refreshRegistered();
@@ -163,9 +198,20 @@ function streamRun(runId) {
   });
 
   es.onerror = () => {
-    try { es.close(); } catch (_) {}
-    currentEs = null;
-    $("#btnRun").disabled = false;
+    if (es.readyState === EventSource.CLOSED) {
+      clearReconnectNoticeTimer();
+      runStreams.delete(runId);
+      if (updateStatus) $("#btnRun").disabled = false;
+      return;
+    }
+    if (!reconnectNotified && reconnectNoticeTimer === null) {
+      reconnectNoticeTimer = setTimeout(() => {
+        reconnectNoticeTimer = null;
+        if (runStreams.get(runId) !== es || es.readyState === EventSource.OPEN) return;
+        reconnectNotified = true;
+        logLine(`${prefix}[client] 日志连接中断，正在自动重连...`, "warn");
+      }, SSE_DISCONNECT_NOTICE_DELAY_MS);
+    }
   };
 }
 
@@ -491,10 +537,17 @@ $("#btnCheckPlus").addEventListener("click", async () => {
 function _selectedRegEmails() {
   return Array.from(document.querySelectorAll(".reg-check:checked")).map(c => c.dataset.email);
 }
+let _copySelectedAtBusy = false;
+
 function _updateSelCountReg() {
   const n = _selectedRegEmails().length;
+  const total = document.querySelectorAll(".reg-check").length;
   $("#selCountReg").textContent = n;
+  $("#selCountAt").textContent = n;
   $("#btnDeleteSelectedReg").disabled = n === 0;
+  $("#btnCopySelectedAt").disabled = n === 0 || _copySelectedAtBusy;
+  $("#regSelectAll").checked = total > 0 && n === total;
+  $("#regSelectAll").indeterminate = n > 0 && n < total;
 }
 $("#regTable").addEventListener("change", (e) => {
   if (e.target.classList.contains("reg-check")) _updateSelCountReg();
@@ -502,6 +555,55 @@ $("#regTable").addEventListener("change", (e) => {
 $("#regSelectAll").addEventListener("change", (e) => {
   document.querySelectorAll(".reg-check").forEach(c => c.checked = e.target.checked);
   _updateSelCountReg();
+});
+
+$("#btnCopySelectedAt").addEventListener("click", async () => {
+  const emails = _selectedRegEmails();
+  if (!emails.length || _copySelectedAtBusy) return;
+
+  const btn = $("#btnCopySelectedAt");
+  _copySelectedAtBusy = true;
+  _updateSelCountReg();
+  $("#exportResult").textContent = `正在读取 ${emails.length} 个账号的 AT...`;
+  $("#exportResult").className = "result";
+
+  try {
+    const credentials = await Promise.allSettled(emails.map(email => _loadCred(email)));
+    const tokens = [];
+    let emptyCount = 0;
+    let failedCount = 0;
+
+    for (const result of credentials) {
+      if (result.status === "rejected") {
+        failedCount++;
+        continue;
+      }
+      const token = String(result.value.access_token || "").trim();
+      if (token) tokens.push(token);
+      else emptyCount++;
+    }
+
+    if (!tokens.length) {
+      throw new Error("所选账号都没有可复制的 access_token");
+    }
+    if (!await _copyText(tokens.join("\n"))) {
+      $("#exportResult").textContent = "❌ 复制失败，请检查浏览器剪贴板权限";
+      $("#exportResult").className = "result bad";
+      return;
+    }
+
+    const skipped = [];
+    if (emptyCount) skipped.push(`${emptyCount} 个无 AT`);
+    if (failedCount) skipped.push(`${failedCount} 个读取失败`);
+    $("#exportResult").textContent = `✅ 已复制 ${tokens.length} 个 AT${skipped.length ? `，跳过 ${skipped.join("、")}` : ""}`;
+    $("#exportResult").className = "result ok";
+  } catch (e) {
+    $("#exportResult").textContent = "❌ " + e.message;
+    $("#exportResult").className = "result bad";
+  } finally {
+    _copySelectedAtBusy = false;
+    _updateSelCountReg();
+  }
 });
 
 $("#btnDeleteSelectedReg").addEventListener("click", async () => {
@@ -563,8 +665,9 @@ async function _copyText(text, btn) {
       ta.style.cssText = "position:fixed;left:-9999px";
       document.body.appendChild(ta);
       ta.select();
-      document.execCommand("copy");
+      const copied = document.execCommand("copy");
       document.body.removeChild(ta);
+      if (!copied) throw new Error("浏览器拒绝写入剪贴板");
     }
     if (btn) {
       const orig = btn.textContent;
@@ -573,8 +676,10 @@ async function _copyText(text, btn) {
       btn.className = cls + " copied";
       setTimeout(() => { btn.textContent = orig; btn.className = cls; }, 1200);
     }
+    return true;
   } catch (e) {
     alert("复制失败: " + e.message);
+    return false;
   }
 }
 
@@ -704,11 +809,21 @@ async function refreshRuns() {
       <td><span class="status ${r.status === 'done' ? 'done' : r.status === 'failed' ? 'failed' : 'running'}">${r.status}</span></td>
       <td>${fmtTime(r.started_at)}</td>
       <td title="${r.error || ''}">${(r.error || '').slice(0, 60)}</td>
+      <td><button type="button" class="view-run-log" data-run-id="${r.run_id}">查看日志</button></td>
     `;
     tb.appendChild(tr);
   }
 }
 $("#btnRefreshRuns").addEventListener("click", refreshRuns);
+$("#runTable tbody").addEventListener("click", (e) => {
+  const button = e.target.closest("button.view-run-log");
+  if (!button) return;
+  $("#logBox").innerHTML = "";
+  $("#runStatus").textContent = `查看 run_id=${button.dataset.runId} 的完整日志`;
+  $("#runStatus").className = "result";
+  streamRun(button.dataset.runId);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+});
 
 // ──────────────────────── 🤖 Auto-Loop 全自动批量 ────────────────────────
 
@@ -791,7 +906,7 @@ function _connectAutoStream() {
       const d = JSON.parse(e.data);
       logLine(`[auto] ▶ 开始注册 ${d.email} (run=${d.run_id})`, "evt");
       // 复用单跑的 SSE 流，自动接管日志框 + 状态栏复制按钮
-      streamRun(d.run_id);
+      streamRun(d.run_id, { replace: false, prefix: true, updateStatus: false });
     } catch (_) {}
   });
   es.addEventListener("run_finished", (e) => {
@@ -809,7 +924,8 @@ function _connectAutoStream() {
     } catch (_) {}
   });
   es.onerror = () => {
-    // 自动重连
+    // CONNECTING 时交给 EventSource 原生重连，避免每次错误都主动断流。
+    if (es.readyState !== EventSource.CLOSED || _autoEs !== es) return;
     try { es.close(); } catch (_) {}
     _autoEs = null;
     setTimeout(_connectAutoStream, 2000);
@@ -1032,6 +1148,9 @@ async function loadSmsConfig() {
     const provider = config.sms_provider || "smsbower";
     await _loadSmsAllCountries(provider);
     $("#smsEnabled").checked = config.sms_enabled === "1";
+    $("#smsProactive").checked = config.sms_proactive === "1";
+    if (!$("#smsEnabled").checked) $("#smsProactive").checked = false;
+    _syncSmsProactiveAvailability();
     const radio = document.querySelector(`input[name="smsProvider"][value="${provider}"]`);
     if (radio) radio.checked = true;
     $("#smsApiKey").value = "";
@@ -1053,6 +1172,16 @@ async function loadSmsConfig() {
     console.error("loadSmsConfig:", e);
   }
 }
+
+function _syncSmsProactiveAvailability() {
+  const enabled = $("#smsEnabled").checked;
+  $("#smsProactive").disabled = !enabled;
+}
+
+$("#smsEnabled").addEventListener("change", () => {
+  if (!$("#smsEnabled").checked) $("#smsProactive").checked = false;
+  _syncSmsProactiveAvailability();
+});
 
 // 切换接码平台时重新加载国家列表
 document.querySelectorAll("input[name='smsProvider']").forEach(radio => {
@@ -1079,6 +1208,7 @@ $("#btnSaveSmsCfg").addEventListener("click", async () => {
   const apiKeyInput = $("#smsApiKey").value.trim();
   const body = {
     sms_enabled:           $("#smsEnabled").checked ? "1" : "0",
+    sms_proactive:         $("#smsProactive").checked ? "1" : "0",
     sms_provider:          document.querySelector("input[name='smsProvider']:checked")?.value || "smsbower",
     sms_api_key:           apiKeyInput || "***",
     sms_country:           $("#smsCountry").value.trim() || "52",

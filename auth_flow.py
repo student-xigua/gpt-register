@@ -28,6 +28,14 @@ from http_client import create_http_session, USER_AGENT
 logger = logging.getLogger(__name__)
 
 
+class SmsRequiredError(RuntimeError):
+    """主动接码模式下，SMS 平台未能完成必须的手机验证。"""
+
+
+class SignupInvalidStateError(RuntimeError):
+    """认证会话在发码前失效，可以用全新 AuthFlow 安全重试。"""
+
+
 class AuthResult:
     """认证结果"""
 
@@ -62,7 +70,12 @@ class AuthResult:
 class AuthFlow:
     """注册/登录协议流"""
 
-    def __init__(self, config: Config, sms_callback: Optional[Any] = None):
+    def __init__(
+        self,
+        config: Config,
+        sms_callback: Optional[Any] = None,
+        sms_required: bool = False,
+    ):
         self.config = config
         self._fingerprint = generate_fingerprint()
         self._ua = self._fingerprint["user_agent"]
@@ -80,6 +93,7 @@ class AuthFlow:
         # 可选 SMS 接码控制器（sms_provider.PhoneCallbackController 实例）
         # 命中 add-phone 时自动租手机号 + 接 SMS 验证码，否则回退到环境变量路径
         self._sms_callback = sms_callback
+        self._sms_required = bool(sms_required)
         self._http_trace_enabled = str(os.getenv("AUTH_HTTP_TRACE", "0")).lower() in ("1", "true", "yes", "on")
         # signup() 会在分支里 set；run_protocol_login 命中已有账号路径会跳过 signup，
         # 导致 kickoff_otp_delivery 读未初始化属性 AttributeError。这里给个默认值。
@@ -469,6 +483,21 @@ class AuthFlow:
     def _is_registration_disallowed_error(exc: Exception) -> bool:
         msg = str(exc).lower()
         return "registration_disallowed" in msg
+
+    @staticmethod
+    def _is_user_already_exists_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        markers = (
+            "user_already_exists",
+            "user already exists",
+            "account already exists",
+        )
+        return any(marker in msg for marker in markers)
+
+    @staticmethod
+    def _is_signup_invalid_state_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "http 409" in msg and "invalid_state" in msg
 
     def _get_cookie_value_by_name(self, name: str) -> str:
         """按 cookie 名称获取值（忽略 domain 冲突）。"""
@@ -941,15 +970,20 @@ class AuthFlow:
         - 优先使用 self._sms_callback（SMS 接码 controller，自动租号 + 接码）
         - 回退到环境变量路径：OPENAI_PHONE_NUMBER + OPENAI_PHONE_OTP_CMD/OPENAI_PHONE_OTP
         """
+        if self._sms_callback is None and self._sms_required:
+            raise SmsRequiredError("主动接码已开启，但接码平台未正确初始化")
+
         if self._sms_callback is not None:
             try:
                 return self._handle_add_phone_via_sms(continue_url)
             except Exception as e:
-                logger.warning("SMS 接码流程失败，回退环境变量路径: %s", e)
                 try:
                     self._sms_callback.cleanup()
                 except Exception:
                     pass
+                if self._sms_required:
+                    raise SmsRequiredError(f"主动接码失败: {e}") from e
+                logger.warning("SMS 接码流程失败，回退环境变量路径: %s", e)
         return self._handle_add_phone_via_env(continue_url)
 
     def _handle_add_phone_via_sms(self, continue_url: str = "") -> str:
@@ -1253,6 +1287,8 @@ class AuthFlow:
                 continue_url = ""
                 try:
                     continue_url = self._codex_drive_login_from_log_in(mail_provider=mail_provider)
+                except SmsRequiredError:
+                    raise
                 except Exception as e:
                     logger.warning(f"Codex 登录推进失败，改走 no-prompt 兜底: {e}")
                 if continue_url:
@@ -1285,10 +1321,10 @@ class AuthFlow:
             # Codex authorize 直接被打到 /add-phone（不经过 /log-in）：
             # 如果配了 SMS 接码 controller，先把手机号绑了再重新 authorize
             if (not callback_url) and self._is_add_phone_state(page_type="", continue_url=final_url or "") \
-                    and self._sms_callback is not None:
+                    and (self._sms_callback is not None or self._sms_required):
                 logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
                 try:
-                    self._handle_add_phone_via_sms(continue_url=final_url)
+                    self._handle_add_phone_verification(continue_url=final_url)
                     # 绑号成功后重新 authorize 拿 callback code
                     callback_url, final_url = self._follow_authorize_for_callback(
                         auth_url, redirect_uri, "codex_authorize_after_add_phone"
@@ -1301,6 +1337,8 @@ class AuthFlow:
                                 redirect_uri,
                                 "codex_authorize_noprompt_after_add_phone",
                             )
+                except SmsRequiredError:
+                    raise
                 except Exception as e:
                     logger.warning(f"SMS 接码绑号失败: {e}")
 
@@ -1324,6 +1362,8 @@ class AuthFlow:
                 redirect_uri=redirect_uri,
                 client_id=client_id,
             )
+        except SmsRequiredError:
+            raise
         except Exception as e:
             logger.warning(f"Codex OAuth 交换异常: {e}")
             return False
@@ -1718,15 +1758,20 @@ class AuthFlow:
             return {}
 
     def signup(self, email: str, sentinel_token: str) -> bool:
-        """提交注册邮箱。返回 True 表示走新注册流程，False 表示已有账号走 OTP 登录流程"""
+        """提交邮箱。True 表示密码注册页，False 表示 email OTP 页或其他分支。"""
         logger.info("[5/10] 提交注册邮箱...")
-        data = self.authorize_continue(
-            email=email,
-            sentinel_token=sentinel_token,
-            screen_hint="signup",
-            referer="https://auth.openai.com/create-account",
-            trace_step="authorize_continue_signup",
-        )
+        try:
+            data = self.authorize_continue(
+                email=email,
+                sentinel_token=sentinel_token,
+                screen_hint="signup",
+                referer="https://auth.openai.com/create-account",
+                trace_step="authorize_continue_signup",
+            )
+        except RuntimeError as exc:
+            if self._is_signup_invalid_state_error(exc):
+                raise SignupInvalidStateError(str(exc)) from exc
+            raise
 
         # 检测 page_type/continue_url，区分新账号与已有账号
         try:
@@ -1743,11 +1788,15 @@ class AuthFlow:
                 logger.info("注册邮箱已提交")
                 return True
 
-            # 已有账号 OTP 分支
+            # email OTP 可能是 passwordless_signup（新账号）或 passwordless_login（已有账号）。
             if page_type == "email_otp_verification":
-                self._existing_email_verification_mode = (payload.get("email_verification_mode", "") or "").strip()
+                mode = (payload.get("email_verification_mode", "") or "").strip()
+                self._existing_email_verification_mode = mode
                 self._existing_page_type = page_type
-                logger.info("检测到已有账号，切换到 OTP 登录流程")
+                if mode.lower() == "passwordless_signup":
+                    logger.info("检测到新账号 passwordless_signup，切换到 OTP 注册流程")
+                else:
+                    logger.info("检测到已有账号 OTP 模式=%s，切换到登录流程", mode or "unknown")
                 self._is_existing_account = True
                 return False
 
@@ -2191,6 +2240,17 @@ class AuthFlow:
         max_hops = 12
 
         for i in range(max_hops):
+            # callback 中的 code 是一次性的。若 start_url 本身就是 callback，
+            # 必须在发起 GET 前返回，让调用方决定交给 NextAuth 还是 token exchange。
+            if "/api/auth/callback/openai" in current_url and "code=" in current_url:
+                callback_url = current_url
+                self._sniff_login_verifier(
+                    current_url,
+                    f"redirect_hop_{i+1}_callback_url",
+                )
+                logger.info("捕获 callback URL（未消费）")
+                break
+
             headers = {
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": "https://chatgpt.com/",
@@ -2200,10 +2260,6 @@ class AuthFlow:
                 current_url, headers=headers, timeout=30, allow_redirects=False
             )
             self._trace_http(f"redirect_hop_{i+1}", resp)
-
-            if "/api/auth/callback/openai" in current_url:
-                callback_url = current_url
-                self._sniff_login_verifier(current_url, f"redirect_hop_{i+1}_callback_url")
 
             # workspace 页面常见为 200，需要主动调 workspace/select 获取下一跳
             if "/workspace" in current_url and resp.status_code == 200:
@@ -2609,6 +2665,43 @@ class AuthFlow:
             logger.warning(f"二次 authorize 交换异常: {e}")
             return False
 
+    def _run_existing_account_login(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+    ) -> AuthResult:
+        """用全新会话重新执行已有账号 OTP 登录，隔离 signup transaction 状态。"""
+        logger.info("检测到已有账号，创建全新登录会话并重新获取 OTP/凭证 ...")
+        login_flow = AuthFlow(
+            self.config,
+            sms_callback=self._sms_callback,
+            sms_required=self._sms_required,
+        )
+        try:
+            result = login_flow.run_protocol_login(
+                mail_provider,
+                email,
+                password=self.result.password,
+                allow_registration_fallback=False,
+            )
+        except SignupInvalidStateError:
+            self.result = login_flow.result
+            try:
+                login_flow.session.close()
+            except Exception:
+                pass
+            raise
+        except SmsRequiredError:
+            self.result = login_flow.result
+            raise
+        except Exception as exc:
+            self.result = login_flow.result
+            raise RuntimeError(f"已有账号重新 OTP 登录失败: {exc}") from exc
+
+        self.result = result
+        logger.info("已有账号重新 OTP 登录成功，已获取有效凭证")
+        return result
+
     # ── 完整注册流程 ──
     def run_register(self, mail_provider: MailProvider) -> AuthResult:
         """执行完整注册流程"""
@@ -2627,11 +2720,17 @@ class AuthFlow:
         sentinel = self.get_sentinel_token(device_id)
         is_new = self.signup(email, sentinel)
 
-        # outlook 接码池邮箱被 OpenAI 标"已有账号" 处理策略:
+        verification_mode = (self._existing_email_verification_mode or "").lower()
+        page_type = (self._existing_page_type or "").lower()
+        is_confirmed_existing = not is_new and (
+            page_type == "login_password" or verification_mode == "passwordless_login"
+        )
+
+        # outlook 接码池邮箱被 OpenAI 明确标为已有账号时的处理策略:
         #   WEBUI_ALLOW_LOGIN=1 (promo-link 等需要拿 access_token 的模式) → 走 OTP login 拿凭证
         #   WEBUI_ALLOW_LOGIN 未设 (register-only 模式) → fast-fail mark dead 换下一个号
         # 这样 register-only 不被 honeypot 拖死, promo-link 又能复用已存在账号.
-        is_outlook_pool = (not is_new and hasattr(mail_provider, "_outlook_creds")
+        is_outlook_pool = (is_confirmed_existing and hasattr(mail_provider, "_outlook_creds")
                            and bool(mail_provider._outlook_creds))
         if is_outlook_pool:
             _allow_login = (os.environ.get("WEBUI_ALLOW_LOGIN", "") or "").strip() in (
@@ -2655,6 +2754,11 @@ class AuthFlow:
                 raise RuntimeError(
                     f"OpenAI 静默拒绝发 OTP (识别 {email} 为已有账号, outlook 池 fast-fail)"
                 )
+
+        if is_confirmed_existing:
+            logger.info(
+                "已有账号分支已建立有效 OTP 事务，沿用当前会话验证并获取凭证"
+            )
 
         if is_new:
             # 新账号：注册密码 → 发 OTP → 验证 → 创建账户
@@ -2710,8 +2814,13 @@ class AuthFlow:
             try:
                 continue_url = self.create_account()
             except Exception as e:
+                if self._is_user_already_exists_error(e):
+                    logger.warning(
+                        "create_account 返回 user_already_exists，放弃当前注册事务并重新 OTP 登录"
+                    )
+                    return self._run_existing_account_login(mail_provider, email)
                 # registration_disallowed 时尝试 reauthorize 兜底，若仍不可用再抛出
-                if self._is_registration_disallowed_error(e):
+                elif self._is_registration_disallowed_error(e):
                     logger.warning("create_account 被拒绝，尝试 reauthorize 兜底获取 session ...")
                     continue_url = self._reauthorize_for_session(auth_url) or ""
                     if not continue_url:
@@ -2719,9 +2828,8 @@ class AuthFlow:
                 else:
                     raise
         else:
-            # 已有账号：直接发 OTP → 验证 → 获取 session
-            mode = (self._existing_email_verification_mode or "").lower()
-            page_type = (self._existing_page_type or "").lower()
+            # passwordless_signup 是新账号 OTP 注册的中间态，不能直接改走 login。
+            mode = verification_mode
             continue_url = ""
 
             try:
@@ -2740,9 +2848,7 @@ class AuthFlow:
                     (login_resp or {}).get("continue_url", "") if isinstance(login_resp, dict) else ""
                 )
 
-                # 部分账号密码校验后仍需 email otp（二次校验）
                 if not continue_url or "/email-verification" in continue_url:
-                    # password/verify 后推荐使用 resend，而不是 /email-otp/send
                     otp_sent_at = time.time()
                     self.kickoff_otp_delivery("existing_login_password")
                     otp_code = mail_provider.wait_for_otp(
@@ -2760,16 +2866,13 @@ class AuthFlow:
                     otp_sent_at = time.time()
                     self.send_otp()
                 else:
-                    # 某些模式在 /authorize/continue 已触发发码，不要重复 /email-otp/send 以免破坏 state
-                    # 默认先尝试 /email-otp/resend 获取新码，失败再回看短窗口
                     forced_resend = self._env_flag("OTP_FORCE_RESEND", "0")
                     if forced_resend and self.kickoff_otp_delivery("existing_forced_resend"):
                         otp_sent_at = time.time()
-                        logger.debug(f"已有账号验证码模式={mode}，已主动 resend OTP")
+                        logger.debug(f"验证码模式={mode}，已主动 resend OTP")
                     else:
-                        # 回看短窗口，避免误读上一轮旧验证码
                         otp_sent_at = time.time() - 8
-                        logger.info(f"已有账号验证码模式={mode}，跳过额外 send_otp，直接等邮件")
+                        logger.info(f"验证码模式={mode}，跳过额外 send_otp，直接等邮件")
 
                 try:
                     otp_code = mail_provider.wait_for_otp(
@@ -2778,13 +2881,10 @@ class AuthFlow:
                         issued_after=otp_sent_at,
                     )
                 except TimeoutError:
-                    # mail/provider IMAP-only 纯协议失败时已设 outlook_exhausted=True 并 mark_dead，
-                    # 不 retry 直接 raise，避免再次等待无效收件链路。
                     if getattr(mail_provider, "outlook_exhausted", False):
                         logger.warning("[outlook] IMAP-only 纯协议收码失败已 mark dead, 跳过 retry resend")
                         raise
-                    # 否则 (非 outlook 池场景, 如 catch_all CF KV) 给一次 resend retry
-                    logger.warning("未等到已有账号 OTP，先重发后重试等待")
+                    logger.warning("未等到 OTP，先重发后重试等待")
                     otp_sent_at = time.time()
                     if not self.kickoff_otp_delivery("existing_timeout_retry"):
                         self.send_otp()
@@ -2795,14 +2895,11 @@ class AuthFlow:
                             issued_after=otp_sent_at,
                         )
                     except TimeoutError:
-                        # outlook 池 + "已有账号" 分支 + 两次 timeout = OpenAI 反欺诈
-                        # 静默拒绝（页面声称已注册但不真发邮件）→ mark dead 该 outlook
-                        # 让池下次跳过，user 重新点 ▶ 自动 claim 下一个 available。
                         if (hasattr(mail_provider, "_outlook_creds")
                                 and mail_provider._outlook_creds):
                             try:
                                 mail_provider.mark_outlook_dead(
-                                    "OpenAI 静默拒绝发 OTP（'已有账号'但 INBOX 无邮件）"
+                                    "OpenAI 静默拒绝发 OTP（email-verification 无邮件）"
                                 )
                             except Exception:
                                 pass
@@ -2832,27 +2929,26 @@ class AuthFlow:
                         self._handle_add_phone_verification(continue_url=continue_url)
                     )
 
-            # 某些已有账号在 OTP 后会进入 about-you，需要补一次 create_account
             if continue_url and "/about-you" in continue_url:
                 try:
                     continue_url = self.create_account()
                 except Exception as e:
+                    if self._is_user_already_exists_error(e):
+                        logger.warning(
+                            "about-you create_account 返回 user_already_exists，"
+                            "放弃当前注册事务并重新 OTP 登录"
+                        )
+                        return self._run_existing_account_login(mail_provider, email)
                     if self._is_registration_disallowed_error(e):
                         logger.warning("about-you create_account 被拒绝，尝试 reauthorize 兜底获取 session ...")
                         continue_url = self._reauthorize_for_session(auth_url) or ""
-                        if continue_url:
-                            logger.info("reauthorize 兜底成功，继续后续 session 获取")
-                            # 下游会走 follow_redirect_chain + get_auth_session
-                            pass
-                        else:
+                        if not continue_url:
                             raise
                     else:
-                        logger.warning(f"已有账号 about-you 创建信息失败，回退 reauthorize: {e}")
+                        logger.warning(f"email-verification 后创建信息失败，回退 reauthorize: {e}")
                         continue_url = ""
 
-            # 若 otp 响应未给可用 continue_url，则回退到 reauthorize
             if not continue_url:
-                # auth.openai.com 的 session cookie 已设置，直接拿 code
                 continue_url = self._reauthorize_for_session(auth_url)
 
         if continue_url:
@@ -2918,10 +3014,18 @@ class AuthFlow:
         return self.result
 
     # ── 纯协议已有账号登录流程（目标：拿 callback/session/refresh） ──
-    def run_protocol_login(self, mail_provider: MailProvider, email: str, password: str = "") -> AuthResult:
+    def run_protocol_login(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        password: str = "",
+        *,
+        allow_registration_fallback: bool = True,
+    ) -> AuthResult:
         """
         纯协议登录（不创建随机邮箱）：
         - 适配 passwordless / login_password 两类已有账号入口
+        - 已确认是已有账号时，可禁止回落注册，避免再次触发 user_already_exists
         - 可配合 OAUTH_EXCHANGE_BEFORE_CALLBACK / OAUTH_REFRESH_ONLY 尝试优先拿 refresh_token
         """
         if not (email or "").strip():
@@ -3001,6 +3105,8 @@ class AuthFlow:
                         (continue_url or "")[:180] or "(empty)",
                     )
             except Exception as e:
+                if self._is_signup_invalid_state_error(e):
+                    raise SignupInvalidStateError(str(e)) from e
                 logger.warning(f"login screen_hint 探测失败，回退 signup 探测: {e}")
                 continue_url = ""
                 page_type = ""
@@ -3009,6 +3115,10 @@ class AuthFlow:
         if not continue_url and page_type not in ("login_password", "email_otp_verification"):
             is_new = self.signup(email, sentinel)
             if is_new:
+                if not allow_registration_fallback:
+                    raise RuntimeError(
+                        "新的登录事务未进入已有账号 OTP 分支，已停止回落注册"
+                    )
                 logger.warning("目标邮箱未命中已有账号分支，回退到注册链路")
                 self.register_password(email)
                 otp_sent_at = time.time()
@@ -3066,15 +3176,18 @@ class AuthFlow:
                 )
 
         continue_url = self._normalize_continue_url(continue_url)
-        # 某些边缘态 OTP 后未返回 callback，回退 reauthorize
-        if not continue_url:
-            continue_url = self._reauthorize_for_session(auth_url) or ""
 
         refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
         callback_url = ""
+        final_url = ""
+        reauthorize_attempted = False
         if continue_url:
             continue_url = self._normalize_continue_url(continue_url)
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
+            if (
+                refresh_only_mode
+                and (not self.result.refresh_token)
+                and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1")
+            ):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             pre_exchange_default = "1" if refresh_only_mode else "0"
             pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
@@ -3086,12 +3199,52 @@ class AuthFlow:
                 if normalized and normalized != final_url:
                     callback_url, final_url = self.follow_redirect_chain(normalized)
 
+        if not callback_url:
+            logger.warning(
+                "已有账号 OTP 后未捕获 callback，final_url=%s，重新 authorize",
+                (final_url or continue_url or "(empty)")[:220],
+            )
+            reauthorize_attempted = True
+            reauthorized_url = self._reauthorize_for_session(auth_url) or ""
+            if reauthorized_url:
+                if "/api/auth/callback/openai" in reauthorized_url and "code=" in reauthorized_url:
+                    callback_url = reauthorized_url
+                else:
+                    callback_url, final_url = self.follow_redirect_chain(reauthorized_url)
+
+        if (not refresh_only_mode) and callback_url:
+            self._consume_callback_for_session(callback_url)
         if not refresh_only_mode:
             self.get_auth_session()
+            if callback_url and (not self.result.is_valid()) and (not reauthorize_attempted):
+                logger.warning(
+                    "首次 callback 未建立有效 session，重新 authorize 后再试一次"
+                )
+                reauthorize_attempted = True
+                reauthorized_url = self._reauthorize_for_session(auth_url) or ""
+                recovered_callback = ""
+                if reauthorized_url:
+                    if (
+                        "/api/auth/callback/openai" in reauthorized_url
+                        and "code=" in reauthorized_url
+                    ):
+                        recovered_callback = reauthorized_url
+                    else:
+                        recovered_callback, final_url = self.follow_redirect_chain(
+                            reauthorized_url
+                        )
+                if recovered_callback:
+                    callback_url = recovered_callback
+                    self._consume_callback_for_session(callback_url)
+                    self.get_auth_session()
 
         if callback_url or continue_url:
             self.fetch_client_auth_session_dump("pre_oauth_exchange_protocol")
-            self.oauth_token_exchange(callback_url or "", continue_url or "")
+            # callback code 已由 NextAuth 消费以换取 session cookie；默认不重复
+            # 用同一个一次性 code 做 token exchange。仅保留显式调试开关。
+            if self._env_flag("OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK", "0") \
+                    and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self.oauth_token_exchange(callback_url or "", continue_url or "")
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
@@ -3194,4 +3347,3 @@ class AuthFlow:
         self.result.email = detected_email or ""
         logger.info("使用已有凭证初始化完成")
         return self.result
-

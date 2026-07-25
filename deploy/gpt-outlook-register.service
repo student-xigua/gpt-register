@@ -1,0 +1,15 @@
+[Unit]
+Description=GPT Outlook Register WebUI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kang
+WorkingDirectory=/opt/gpt-outlook-register
+ExecStart=/opt/gpt-outlook-register/.venv/bin/python start_webui.py --no-browser --host 127.0.0.1 --port 8766
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

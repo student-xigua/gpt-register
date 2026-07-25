@@ -88,6 +88,13 @@
   <!-- 右：日志 + 列表 -->
   <section class="card">
     <h2>📜 实时日志</h2>
+    <div class="log-toolbar">
+      <label class="check compact">
+        <input type="checkbox" id="logAutoScroll" checked>
+        自动滚动
+      </label>
+      <button type="button" id="btnClearLog" title="清空当前日志视图">清空</button>
+    </div>
     <div id="logBox" class="log"></div>
 
     <div class="tabs">
@@ -155,6 +162,7 @@
         <button id="btnDeleteSelectedReg" title="删除已勾选的凭证" disabled>🗑️ 删除选中 (<span id="selCountReg">0</span>)</button>
         <button id="btnDeleteAllReg" title="清空所有注册结果（危险）">💥 清空全部</button>
         <button id="btnCheckPlus" title="检查当前页所有号的 Plus 试用状态（使用上方代理）">🔍 检查Plus</button>
+        <button id="btnCopySelectedAt" class="primary" title="复制已勾选账号的 access_token，每行一个" disabled>📋 复制选中 AT (<span id="selCountAt">0</span>)</button>
         <span id="checkPlusResult" class="result"></span>
         <span id="exportResult" class="result"></span>
       </div>
@@ -177,7 +185,7 @@
         <button id="btnRefreshRuns">刷新</button>
       </div>
       <table id="runTable">
-        <thead><tr><th>run_id</th><th>邮箱</th><th>状态</th><th>开始时间</th><th>错误</th></tr></thead>
+        <thead><tr><th>run_id</th><th>邮箱</th><th>状态</th><th>开始时间</th><th>错误</th><th>操作</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -232,6 +240,12 @@
         <label class="check">
           <input type="checkbox" id="smsEnabled">
           <b>启用 SMS 接码</b> <small>（命中 add-phone 时自动租号，否则回退到环境变量路径）</small>
+        </label>
+
+        <label class="check">
+          <input type="checkbox" id="smsProactive">
+          <b>主动接码（严格模式）</b>
+          <small>（仅在命中 add-phone 后租号；平台接码失败时终止本次任务，不回退环境变量）</small>
         </label>
 
         <fieldset>

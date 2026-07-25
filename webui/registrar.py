@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -13,6 +14,7 @@ import threading
 import time
 import traceback
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -21,14 +23,27 @@ sys.path.insert(0, str(ROOT))
 
 from config import Config  # noqa: E402
 from mail_outlook import OutlookMailProvider  # noqa: E402
-from auth_flow import AuthFlow  # noqa: E402
+from auth_flow import AuthFlow, SignupInvalidStateError, SmsRequiredError  # noqa: E402
 from sms_provider import PhoneCallbackController  # noqa: E402
 
 from . import db  # noqa: E402
 
-# run_id -> queue of log strings; sentinel = None 表示流结束
-_run_queues: dict[str, queue.Queue] = {}
+# 每个 run 保留历史事件，并为每个 SSE 客户端分配独立队列。
+# 这样晚连接、浏览器重连和多客户端查看都不会消费彼此的日志。
+@dataclass
+class RunStream:
+    history: list[tuple[int, str]] = field(default_factory=list)
+    subscribers: set[queue.Queue] = field(default_factory=set)
+    next_event_id: int = 1
+    finished: bool = False
+    finished_at: float = 0.0
+    journal_path: Optional[Path] = None
+    journal_file: object = None
+
+
+_run_streams: dict[str, RunStream] = {}
 _lock = threading.Lock()
+_MAX_COMPLETED_STREAMS = 100
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,20 +55,23 @@ class QueueLogHandler(logging.Handler):
     def __init__(self, run_id: str, log_file: Path):
         super().__init__()
         self.run_id = run_id
+        self._thread_id = threading.get_ident()
         self._fh = open(log_file, "a", encoding="utf-8")
         self.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%H:%M:%S",
         ))
 
+    def filter(self, record: logging.LogRecord) -> bool:
+        # 根 logger 上可能同时挂多个注册任务的 handler，只收本任务线程日志。
+        return record.thread == self._thread_id
+
     def emit(self, record: logging.LogRecord):
         try:
             msg = self.format(record)
             self._fh.write(msg + "\n")
             self._fh.flush()
-            q = _run_queues.get(self.run_id)
-            if q is not None:
-                q.put(msg)
+            _publish_run_event(self.run_id, msg)
         except Exception:
             pass
 
@@ -68,12 +86,127 @@ class QueueLogHandler(logging.Handler):
 def _emit_status(run_id: str, kind: str, payload: dict | str = ""):
     """前端约定：以 `__EVENT__:` 开头的行被解析成 JSON 状态事件。"""
     import json as _json
-    q = _run_queues.get(run_id)
-    if q is None:
-        return
-    body = payload if isinstance(payload, dict) else {"message": str(payload)}
+    body = dict(payload) if isinstance(payload, dict) else {"message": str(payload)}
     body["kind"] = kind
-    q.put("__EVENT__:" + _json.dumps(body, ensure_ascii=False))
+    _publish_run_event(run_id, "__EVENT__:" + _json.dumps(body, ensure_ascii=False))
+
+
+def _publish_run_event(run_id: str, message: str) -> int:
+    """原子地追加历史并广播；返回单调递增的 SSE event id。"""
+    with _lock:
+        stream = _run_streams.get(run_id)
+        if stream is None:
+            return 0
+        event_id = stream.next_event_id
+        stream.next_event_id += 1
+        event = (event_id, message)
+        stream.history.append(event)
+        if stream.journal_file is not None:
+            stream.journal_file.write(
+                json.dumps({"id": event_id, "message": message}, ensure_ascii=False) + "\n"
+            )
+            stream.journal_file.flush()
+        subscribers = tuple(stream.subscribers)
+    for subscriber in subscribers:
+        subscriber.put(event)
+    return event_id
+
+
+def subscribe_run(run_id: str, after_event_id: int = 0):
+    """订阅 run，返回 (历史事件, 实时队列, 是否已结束)。"""
+    with _lock:
+        stream = _run_streams.get(run_id)
+        if stream is None:
+            return None
+        history = [event for event in stream.history if event[0] > after_event_id]
+        if stream.finished:
+            return history, None, True
+        subscriber: queue.Queue = queue.Queue()
+        stream.subscribers.add(subscriber)
+        return history, subscriber, False
+
+
+def unsubscribe_run(run_id: str, subscriber: Optional[queue.Queue]) -> None:
+    if subscriber is None:
+        return
+    with _lock:
+        stream = _run_streams.get(run_id)
+        if stream is not None:
+            stream.subscribers.discard(subscriber)
+
+
+def _finish_run_stream(run_id: str) -> None:
+    with _lock:
+        stream = _run_streams.get(run_id)
+        if stream is None or stream.finished:
+            return
+        event_id = stream.next_event_id
+        stream.next_event_id += 1
+        event = (event_id, "__END__")
+        stream.history.append(event)
+        if stream.journal_file is not None:
+            stream.journal_file.write(
+                json.dumps({"id": event_id, "message": "__END__"}, ensure_ascii=False) + "\n"
+            )
+            stream.journal_file.flush()
+            stream.journal_file.close()
+            stream.journal_file = None
+        stream.finished = True
+        stream.finished_at = time.time()
+        subscribers = tuple(stream.subscribers)
+        stream.subscribers.clear()
+    for subscriber in subscribers:
+        subscriber.put(event)
+        subscriber.put(None)
+
+
+def get_persisted_run_events(run_id: str, after_event_id: int = 0):
+    """进程重启后从日志文件回放已落盘的运行记录。"""
+    row = db.get_run(run_id)
+    if not row:
+        return None
+    log_path = Path(row.get("log_path") or "")
+    journal_path = log_path.with_suffix(".events.jsonl")
+    if journal_path.is_file():
+        events: list[tuple[int, str]] = []
+        try:
+            with journal_path.open("r", encoding="utf-8", errors="replace") as journal:
+                for raw in journal:
+                    try:
+                        item = json.loads(raw)
+                        event_id = int(item["id"])
+                        message = str(item["message"])
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if event_id > after_event_id:
+                        events.append((event_id, message))
+        except OSError:
+            return [], True
+        return events, True
+    if not log_path.is_file():
+        return [], True
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return [], True
+    events = [(index, line) for index, line in enumerate(lines, 1) if index > after_event_id]
+    return events, True
+
+
+def _prune_completed_streams_locked() -> None:
+    completed = sorted(
+        (
+            (run_id, stream.finished_at)
+            for run_id, stream in _run_streams.items()
+            if stream.finished
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    for run_id, _ in completed[_MAX_COMPLETED_STREAMS:]:
+        stream = _run_streams.pop(run_id, None)
+        if stream is not None and stream.journal_file is not None:
+            stream.journal_file.close()
 
 
 # 网络/环境层错误特征：命中任一就把号放回 available（号本身没问题，是环境炸了）
@@ -81,7 +214,9 @@ _NETWORK_ERROR_PATTERNS = [
     "tls", "ssl", "sslerror", "connection", "connect error", "timeout", "timed out",
     "proxy", "socks", "dns", "name resolution", "name or service",
     "cloudflare", "just a moment", "403 forbidden",
+    "主动接码", "sms 接码",
     "csrf token 获取失败", "csrf token 失败",
+    "invalid_state", "sign-in session is no longer valid",
     "/sentinel/req", "sentinel /req", "sentinel quickjs",
     "check_proxy 失败", "网络预检查",
     "curl: (35)", "curl: (28)", "curl: (6)", "curl: (7)",
@@ -186,15 +321,45 @@ def _do_register(
                 refresh_token=account["refresh_token"],
             )
 
-        flow = AuthFlow(cfg, sms_callback=_build_sms_callback(run_id))
+        sms_cfg = db.get_sms_internal_config()
+        sms_required = bool(sms_cfg.get("sms_enabled") and sms_cfg.get("sms_proactive"))
+        sms_callback = _build_sms_callback(run_id, sms_cfg)
+        if sms_cfg.get("sms_enabled"):
+            mode = "主动接码（失败即终止）" if sms_required else "兼容接码（失败可回退）"
+            logging.getLogger("registrar").info(f"[sms] 模式: {mode}")
+        def new_auth_flow() -> AuthFlow:
+            return AuthFlow(
+                cfg,
+                sms_callback=sms_callback,
+                sms_required=sms_required,
+            )
+
+        flow = new_auth_flow()
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         logging.getLogger("registrar").info(f"[register] 开始: {email}")
 
         partial = False
         d: dict
         try:
-            result = flow.run_register(mail)
+            max_auth_attempts = 2 if mail_source == "outlook" else 1
+            for auth_attempt in range(1, max_auth_attempts + 1):
+                try:
+                    result = flow.run_register(mail)
+                    break
+                except SignupInvalidStateError:
+                    if auth_attempt >= max_auth_attempts:
+                        raise
+                    logging.getLogger("registrar").warning(
+                        "[register] 认证会话 invalid_state，丢弃旧会话并完整重试一次"
+                    )
+                    try:
+                        flow.session.close()
+                    except Exception:
+                        pass
+                    flow = new_auth_flow()
             d = result.to_dict()
+        except SmsRequiredError:
+            raise
         except RuntimeError as e:
             # 部分凭证也算成功（OTP 验证通过 + create_account 成功 → flow.result 有 token）
             d = flow.result.to_dict()
@@ -271,9 +436,11 @@ def _do_register(
         # CF 模式下不操作号池
         if mail_source != "cf_temp":
             if category == "network":
-                db.release_unused(email)
+                cooldown = 300 if isinstance(e, SignupInvalidStateError) else 0
+                db.release_unused(email, cooldown_seconds=cooldown)
                 logging.getLogger("registrar").warning(
                     f"[register] {email} 判定为网络/环境错误，号已 release 回 available"
+                    + (f"（冷却 {cooldown}s）" if cooldown else "")
                 )
             else:
                 db.mark_failed(email, f"[{category}] {err}")
@@ -293,9 +460,7 @@ def _do_register(
             handler.close()
         except Exception:
             pass
-        q = _run_queues.get(run_id)
-        if q is not None:
-            q.put(None)  # sentinel: 流结束
+        _finish_run_stream(run_id)
 
 
 def _try_export_to_panels(run_id: str, cred: dict) -> None:
@@ -356,17 +521,22 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
         pass
 
 
-def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
+def _build_sms_callback(
+    run_id: str,
+    cfg: Optional[dict] = None,
+) -> Optional[PhoneCallbackController]:
     """根据 webui 配置创建 SMS 接码 controller。
 
     未启用接码或未配置 API key 时返回 None，flow 会回退到环境变量路径。
     log_fn 把租号/等码的状态推到 SSE 流，前端可见。
     """
-    cfg = db.get_sms_internal_config()
+    cfg = cfg or db.get_sms_internal_config()
     if not cfg.get("sms_enabled"):
         return None
     api_key = (cfg.get("sms_api_key") or "").strip()
     if not api_key:
+        if cfg.get("sms_proactive"):
+            raise SmsRequiredError("主动接码已开启，但未配置 SMS API Key")
         logging.getLogger("registrar").warning("[sms] 已启用接码但未配置 sms_api_key，跳过")
         return None
 
@@ -390,6 +560,8 @@ def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
             auto_select_country=bool(cfg.get("sms_auto_country")),
         )
     except Exception as e:
+        if cfg.get("sms_proactive"):
+            raise SmsRequiredError(f"主动接码 controller 创建失败: {e}") from e
         smslog.warning(f"[sms] 创建接码 controller 失败: {e}")
         return None
 
@@ -400,9 +572,13 @@ def start_registration(account: dict, options: dict) -> str:
     log_file = LOG_DIR / f"{run_id}.log"
     db.create_run(run_id, account["email"], str(log_file))
 
-    q: queue.Queue = queue.Queue()
     with _lock:
-        _run_queues[run_id] = q
+        _prune_completed_streams_locked()
+        journal_path = log_file.with_suffix(".events.jsonl")
+        _run_streams[run_id] = RunStream(
+            journal_path=journal_path,
+            journal_file=journal_path.open("w", encoding="utf-8"),
+        )
 
     th = threading.Thread(
         target=_do_register,
@@ -412,12 +588,3 @@ def start_registration(account: dict, options: dict) -> str:
     )
     th.start()
     return run_id
-
-
-def get_run_queue(run_id: str) -> Optional[queue.Queue]:
-    return _run_queues.get(run_id)
-
-
-def remove_run_queue(run_id: str) -> None:
-    with _lock:
-        _run_queues.pop(run_id, None)

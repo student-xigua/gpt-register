@@ -186,11 +186,20 @@ def fetch_otp_via_graph(
                         messages = _graph_list_messages(access_token, folder)
                     except FatalOutlookMailError:
                         raise
+                    except urllib.error.HTTPError as retry_error:
+                        if retry_error.code in (400, 401, 403):
+                            raise FatalOutlookMailError(
+                                f"Graph API 认证失败: HTTP {retry_error.code}"
+                            ) from retry_error
+                        logger.debug(
+                            f"[outlook-graph] {folder} retry HTTP {retry_error.code}"
+                        )
+                        continue
                     except Exception:
                         continue
-                elif e.code in (400, 403):
+                elif e.code in (400, 401, 403):
                     raise FatalOutlookMailError(
-                        f"Graph API 无权限: HTTP {e.code}"
+                        f"Graph API 认证/权限失败: HTTP {e.code}"
                     )
                 else:
                     logger.debug(f"[outlook-graph] {folder} HTTP {e.code}")

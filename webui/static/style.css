@@ -190,6 +190,16 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .result.bad { color: var(--bad); }
 
 /* 日志框 */
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: -4px 0 8px;
+}
+.log-toolbar .compact { margin: 0; font-size: 12px; }
+.log-toolbar button { padding: 5px 10px; }
+
 .log {
   background: var(--code-bg);
   color: var(--code-text);
@@ -198,8 +208,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 12px;
   line-height: 1.5;
-  height: 280px;
+  height: clamp(320px, 45vh, 520px);
+  min-height: 240px;
+  max-height: 70vh;
   overflow-y: auto;
+  resize: vertical;
   white-space: pre-wrap;
   word-break: break-all;
 }

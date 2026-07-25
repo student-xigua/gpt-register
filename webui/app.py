@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import sys
 import time
 from pathlib import Path
@@ -42,6 +43,9 @@ logging.basicConfig(
 logger = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+SSE_HEARTBEAT_SECONDS = 10
+SSE_RETRY_MILLISECONDS = 2000
+_SSE_HEARTBEAT = object()
 
 app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
 
@@ -187,29 +191,63 @@ def api_register(req: RegisterReq):
 
 @app.get("/api/runs/{run_id}/stream")
 async def api_stream(run_id: str, request: Request):
-    """SSE 实时推送日志 + 事件。"""
-    q = registrar.get_run_queue(run_id)
-    if q is None:
-        raise HTTPException(404, "run_id not found or finished")
+    """SSE 推送完整历史 + 实时日志，支持 Last-Event-ID 断线续传。"""
+    try:
+        after_event_id = max(0, int(request.headers.get("last-event-id") or "0"))
+    except (TypeError, ValueError):
+        after_event_id = 0
+
+    subscription = registrar.subscribe_run(run_id, after_event_id)
+    if subscription is None:
+        persisted = registrar.get_persisted_run_events(run_id, after_event_id)
+        if persisted is None:
+            raise HTTPException(404, "run_id not found")
+        history, _ = persisted
+        subscriber = None
+        finished = True
+    else:
+        history, subscriber, finished = subscription
+
+    def encode_event(event_id: int, msg: str) -> str:
+        if msg == "__END__":
+            event_name = "end"
+            data = "{}"
+        elif msg.startswith("__EVENT__:"):
+            event_name = "status"
+            data = msg[len("__EVENT__:"):]
+        else:
+            event_name = "log"
+            data = json.dumps({"line": msg}, ensure_ascii=False)
+        return f"id: {event_id}\nevent: {event_name}\ndata: {data}\n\n"
 
     async def event_gen():
         loop = asyncio.get_event_loop()
         try:
+            yield _sse_preamble()
+            for event_id, msg in history:
+                yield encode_event(event_id, msg)
+                if msg == "__END__":
+                    return
+            if finished:
+                yield "event: end\ndata: {}\n\n"
+                return
+
             while True:
                 if await request.is_disconnected():
                     break
-                # 从队列取消息（用 run_in_executor 避免阻塞 event loop）
-                msg = await loop.run_in_executor(None, _safe_get, q)
-                if msg is None:
-                    # sentinel: 任务结束
+                item = await loop.run_in_executor(None, _safe_get, subscriber)
+                if item is _SSE_HEARTBEAT:
+                    yield _sse_heartbeat_frame()
+                    continue
+                if item is None:
                     yield "event: end\ndata: {}\n\n"
                     break
-                if msg.startswith("__EVENT__:"):
-                    yield f"event: status\ndata: {msg[len('__EVENT__:'):]}\n\n"
-                else:
-                    yield f"event: log\ndata: {json.dumps({'line': msg}, ensure_ascii=False)}\n\n"
+                event_id, msg = item
+                yield encode_event(event_id, msg)
+                if msg == "__END__":
+                    break
         finally:
-            registrar.remove_run_queue(run_id)
+            registrar.unsubscribe_run(run_id, subscriber)
 
     return StreamingResponse(
         event_gen(),
@@ -224,9 +262,17 @@ async def api_stream(run_id: str, request: Request):
 
 def _safe_get(q):
     try:
-        return q.get(timeout=60)
-    except Exception:
-        return ""  # 心跳：返空串让 SSE 检查 disconnect
+        return q.get(timeout=SSE_HEARTBEAT_SECONDS)
+    except queue.Empty:
+        return _SSE_HEARTBEAT
+
+
+def _sse_preamble():
+    return f"retry: {SSE_RETRY_MILLISECONDS}\n: connected\n\n"
+
+
+def _sse_heartbeat_frame():
+    return ": keep-alive\n\n"
 
 
 @app.get("/api/runs")
@@ -334,6 +380,7 @@ def api_get_sms_config():
 
 class SaveSmsConfigReq(BaseModel):
     sms_enabled: Optional[str] = None              # "0" / "1"
+    sms_proactive: Optional[str] = None            # "1" = 平台接码失败时不回退环境变量
     sms_provider: Optional[str] = None             # smsbower / herosms
     sms_api_key: Optional[str] = None              # 传 '***' 表示不修改
     sms_country: Optional[str] = None              # ID 或国家代码（'52' / 'th'）
@@ -686,14 +733,13 @@ async def api_auto_stream(request: Request):
     async def gen():
         loop = asyncio.get_event_loop()
         try:
+            yield _sse_preamble()
             while True:
                 if await request.is_disconnected():
                     break
-                # 阻塞拿消息，但每 30s 心跳
-                try:
-                    msg = await loop.run_in_executor(None, lambda: q.get(timeout=30))
-                except Exception:
-                    yield ": heartbeat\n\n"
+                msg = await loop.run_in_executor(None, _safe_get, q)
+                if msg is _SSE_HEARTBEAT:
+                    yield _sse_heartbeat_frame()
                     continue
                 if msg is None:
                     break

@@ -38,7 +38,8 @@ def init_db():
             imported_at     REAL,
             claimed_at      REAL,
             finished_at     REAL,
-            fail_reason     TEXT
+            fail_reason     TEXT,
+            retry_after     REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_outlook_status ON outlook_accounts(status);
@@ -79,6 +80,11 @@ def init_db():
     cols = {r[1] for r in cur.fetchall()}
     if "error_category" not in cols:
         con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
+        con.commit()
+    cur = con.execute("PRAGMA table_info(outlook_accounts)")
+    account_cols = {r[1] for r in cur.fetchall()}
+    if "retry_after" not in account_cols:
+        con.execute("ALTER TABLE outlook_accounts ADD COLUMN retry_after REAL")
         con.commit()
 
 
@@ -130,7 +136,7 @@ def import_accounts(text: str) -> dict:
             elif existing["refresh_token"] != r["refresh_token"]:
                 con.execute(
                     "UPDATE outlook_accounts SET refresh_token=?, password=?, client_id=?, "
-                    "status='available', imported_at=?, fail_reason=NULL WHERE email=?",
+                    "status='available', imported_at=?, fail_reason=NULL, retry_after=NULL WHERE email=?",
                     (r["refresh_token"], r["password"], r["client_id"], now, r["email"]),
                 )
                 updated += 1
@@ -190,7 +196,7 @@ def claim_account(email: str) -> Optional[dict]:
         if not row:
             return None
         rc = con.execute(
-            "UPDATE outlook_accounts SET status='in_use', claimed_at=?, fail_reason=NULL "
+            "UPDATE outlook_accounts SET status='in_use', claimed_at=?, fail_reason=NULL, retry_after=NULL "
             "WHERE email=? AND status IN ('available', 'failed')",
             (time.time(), email),
         )
@@ -204,17 +210,20 @@ def claim_next() -> Optional[dict]:
     """原子 claim 任一 available 号。"""
     with _lock:
         con = _conn()
+        now = time.time()
         cur = con.execute(
             "SELECT * FROM outlook_accounts WHERE status='available' "
-            "ORDER BY imported_at ASC LIMIT 1"
+            "AND COALESCE(retry_after, 0) <= ? "
+            "ORDER BY imported_at ASC LIMIT 1",
+            (now,),
         )
         row = cur.fetchone()
         if not row:
             return None
         rc = con.execute(
-            "UPDATE outlook_accounts SET status='in_use', claimed_at=? "
-            "WHERE email=? AND status='available'",
-            (time.time(), row["email"]),
+            "UPDATE outlook_accounts SET status='in_use', claimed_at=?, retry_after=NULL "
+            "WHERE email=? AND status='available' AND COALESCE(retry_after, 0) <= ?",
+            (now, row["email"], now),
         )
         con.commit()
         if rc.rowcount != 1:
@@ -226,7 +235,8 @@ def mark_done(email: str) -> None:
     with _lock:
         con = _conn()
         con.execute(
-            "UPDATE outlook_accounts SET status='done', finished_at=?, fail_reason=NULL WHERE email=?",
+            "UPDATE outlook_accounts SET status='done', finished_at=?, fail_reason=NULL, retry_after=NULL "
+            "WHERE email=?",
             (time.time(), email.lower()),
         )
         con.commit()
@@ -236,20 +246,23 @@ def mark_failed(email: str, reason: str = "") -> None:
     with _lock:
         con = _conn()
         con.execute(
-            "UPDATE outlook_accounts SET status='failed', finished_at=?, fail_reason=? WHERE email=?",
+            "UPDATE outlook_accounts SET status='failed', finished_at=?, fail_reason=?, retry_after=NULL "
+            "WHERE email=?",
             (time.time(), (reason or "")[:500], email.lower()),
         )
         con.commit()
 
 
-def release_unused(email: str) -> None:
+def release_unused(email: str, cooldown_seconds: float = 0) -> None:
     """claim 后没真注册（异常 / 用户取消）→ 还回 available。"""
+    cooldown = max(0.0, float(cooldown_seconds or 0))
+    retry_after = time.time() + cooldown if cooldown > 0 else None
     with _lock:
         con = _conn()
         con.execute(
-            "UPDATE outlook_accounts SET status='available', claimed_at=NULL "
+            "UPDATE outlook_accounts SET status='available', claimed_at=NULL, retry_after=? "
             "WHERE email=? AND status='in_use'",
-            (email.lower(),),
+            (retry_after, email.lower()),
         )
         con.commit()
 
@@ -263,7 +276,7 @@ def reset_to_available(email: str) -> bool:
         con = _conn()
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', claimed_at=NULL, "
-            "finished_at=NULL, fail_reason=NULL "
+            "finished_at=NULL, fail_reason=NULL, retry_after=NULL "
             "WHERE lower(email)=lower(?)",
             (email,),
         )
@@ -279,7 +292,7 @@ def bulk_reset_to_available(emails: list[str]) -> int:
         con = _conn()
         rc = con.execute(
             f"UPDATE outlook_accounts SET status='available', claimed_at=NULL, "
-            f"finished_at=NULL, fail_reason=NULL "
+            f"finished_at=NULL, fail_reason=NULL, retry_after=NULL "
             f"WHERE lower(email) IN ({','.join(['lower(?)'] * len(emails))})",
             emails,
         )
@@ -296,7 +309,7 @@ def reset_failed_to_available() -> int:
         con = _conn()
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', fail_reason=NULL, "
-            "finished_at=NULL WHERE status='failed'"
+            "finished_at=NULL, retry_after=NULL WHERE status='failed'"
         )
         con.commit()
         return rc.rowcount
@@ -576,6 +589,12 @@ def list_runs(limit: int = 50) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def get_run(run_id: str) -> Optional[dict]:
+    con = _conn()
+    row = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
 # ──────────────────────── settings (KV) ────────────────────────
 
 
@@ -637,6 +656,7 @@ def get_sms_config() -> dict:
     """返回 SMS 接码配置（api_key 隐藏明文）。
 
     sms_enabled:        '0'/'1' 是否启用接码（命中 add-phone 时才会用）
+    sms_proactive:      '0'/'1' 主动接码严格模式（平台失败时不回退环境变量）
     sms_provider:       smsbower
     sms_country:        国家代码或 ID（推荐 '52' = Thailand，OpenAI 走 SMS 的唯一稳定国家）
     sms_service:        服务代码（OpenAI = 'dr'）
@@ -649,6 +669,7 @@ def get_sms_config() -> dict:
     """
     return {
         "sms_enabled":             get_setting("sms_enabled", "0"),
+        "sms_proactive":           get_setting("sms_proactive", "0"),
         "sms_provider":            get_setting("sms_provider", "smsbower"),
         "sms_api_key":             "***" if get_setting("sms_api_key") else "",
         "sms_country":             get_setting("sms_country", "52"),
@@ -685,7 +706,10 @@ def save_sms_config(data: dict) -> None:
         if key in data:
             set_setting(key, str(data[key]).strip())
     # 布尔字段（前端传 '0'/'1' 或 bool）
-    for key in ("sms_enabled", "sms_reuse_phone", "sms_auto_country", "sms_strict_whitelist"):
+    for key in (
+        "sms_enabled", "sms_proactive", "sms_reuse_phone",
+        "sms_auto_country", "sms_strict_whitelist",
+    ):
         if key in data:
             v = data[key]
             if isinstance(v, bool):
@@ -693,6 +717,8 @@ def save_sms_config(data: dict) -> None:
             else:
                 s = str(v).strip().lower()
                 set_setting(key, "1" if s in ("1", "true", "yes", "on") else "0")
+    if get_setting("sms_enabled", "0") != "1":
+        set_setting("sms_proactive", "0")
     # API key（'***' 不修改）
     if data.get("sms_api_key") and data["sms_api_key"] != "***":
         set_setting("sms_api_key", str(data["sms_api_key"]).strip())
@@ -702,6 +728,7 @@ def get_sms_internal_config() -> dict:
     """内部用：拿明文 sms_api_key,供 sms_provider 实例化使用。"""
     return {
         "sms_enabled":             get_setting("sms_enabled", "0") in ("1", "true"),
+        "sms_proactive":           get_setting("sms_proactive", "0") in ("1", "true"),
         "sms_provider":            get_setting("sms_provider", "smsbower"),
         "sms_api_key":             get_setting("sms_api_key", ""),
         "sms_country":             get_setting("sms_country", "52"),
