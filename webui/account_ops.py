@@ -378,13 +378,18 @@ def start_sub2_export(emails: list[str]) -> tuple[str, int, int]:
     return _run_async(task, worker), len(eligible), task.skipped
 
 
-def _pick_proxy(pool_text: str) -> str:
-    """从多行代理池里随机取一行（忽略空行与 # 注释）。"""
-    lines = [
+def _pool_lines(pool_text: str) -> list[str]:
+    """把多行代理池拆成干净行列表（忽略空行与 # 注释）。"""
+    return [
         ln.strip()
         for ln in str(pool_text or "").splitlines()
         if ln.strip() and not ln.strip().startswith("#")
     ]
+
+
+def _pick_proxy(pool_text: str) -> str:
+    """从多行代理池里随机取一行（忽略空行与 # 注释）。"""
+    lines = _pool_lines(pool_text)
     return random.choice(lines) if lines else ""
 
 
@@ -433,15 +438,23 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                     method,
                     checkout_proxy=checkout_proxy,
                     update_proxy=update_proxy,
+                    checkout_pool=_pool_lines(pool1),
                     poll_seconds=poll_seconds,
                     log=progress,
                 )
                 link = str(result.get("link") or "").strip()
                 if not link:
+                    states = result.get("approve_states") or []
+                    if states and all(s == "blocked" for s in states):
+                        hint = "OpenAI 风控 block 了所有 approve 出口，换一批住宅代理节点或稍后重试。"
+                    elif states and all(s in ("timeout", "error") for s in states):
+                        hint = "approve 出口全部超时/异常，代理节点不通，换一批节点重试。"
+                    else:
+                        hint = "可换一批代理节点或稍后重试。"
                     raise AccountOperationError(
                         "LINK_NOT_FOUND",
                         f"未能提炼到 {label} 链接（金额 {result.get('amount')}）。",
-                        "可换一个代理节点或稍后重试。",
+                        hint,
                     )
                 db.update_registered_link(email, method, link)
                 state.succeeded += 1

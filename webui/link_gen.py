@@ -105,6 +105,38 @@ def _profile(method: str) -> dict[str, str]:
     }
 
 
+REGION_TAG_RE = re.compile(r"region-([A-Za-z]{2})", re.I)
+
+
+def _force_region(proxy: str, region: str) -> str:
+    """把住宅代理用户名里的 region-XX 改成目标国家（cliproxy / 1024 等多地池）。
+
+    approve/checkout 必须走账单国（IN/KR）出口，压价 update 走 BR。用户常把同一份
+    IN 池粘到两个框，靠这个把 region 标签强制成正确国家；池里没有 region- 标签就原样返回。
+    """
+    text = (proxy or "").strip()
+    code = (region or "").strip().upper()[:2]
+    if not text or not code:
+        return text
+    if REGION_TAG_RE.search(text):
+        return REGION_TAG_RE.sub(f"region-{code}", text, count=1)
+    return text
+
+
+def _approve_exits(pool: Optional[list[str]], fallback: str, region: str, n: int) -> list[str]:
+    """为 approve 挑 n 个「不同预置节点」的出口，全部强制成 channel 国家（IN/KR）。
+
+    approve 会被 OpenAI 风控按出口 IP 逐个 block，所以必须走池里多条不同 sticky 线路
+    并发打，命中一个 approved 即可。从随机位置开始遍历，避免多账号老是压同几行。
+    """
+    lines = [ln.strip() for ln in (pool or []) if ln and ln.strip() and not ln.strip().startswith("#")]
+    if not lines:
+        lines = [fallback] if fallback else [""]
+    n = max(1, min(int(n or 1), 16))
+    start = random.randrange(len(lines)) if len(lines) > 1 else 0
+    return [_force_region(lines[(start + i) % len(lines)], region) for i in range(n)]
+
+
 def _normalize_proxy(raw: str) -> str:
     raw = (raw or "").strip()
     if not raw or "://" in raw:
@@ -252,14 +284,20 @@ def generate_link(
     *,
     checkout_proxy: str = "",
     update_proxy: str = "",
+    checkout_pool: Optional[list[str]] = None,
+    update_pool: Optional[list[str]] = None,
     poll_seconds: int = 35,
-    approve_workers: int = 2,
+    approve_workers: int = 10,
     log: Optional[Callable[..., None]] = None,
 ) -> dict:
-    """跑一遍提链流程，返回 {"ok", "link", "amount", ...}。
+    """跑一遍提链流程，返回 {"ok", "link", "amount", "approve_states", ...}。
 
-    checkout_proxy 走账单国出口（IN/KR），update_proxy 走压价出口；
-    只给一个代理时两者相同即可。
+    流程：IN 出口建 checkout → BR 出口压促销价 → IN 出口确认 → 多条 IN 线路并发
+    approve（风控逐 IP block，靠多样性命中）→ IN 出口轮询取托管链接。
+
+    checkout_proxy 走账单国出口（IN/KR），update_proxy 走压价出口（BR）。
+    checkout_pool 是账单国整池，approve 从里面挑多条不同 sticky 线路并发打；
+    留空则退化成只用 checkout_proxy 一条线。
     """
     method = (method or "").lower()
     if method not in METHODS:
@@ -270,12 +308,16 @@ def generate_link(
         raise RuntimeError("该账号没有可用的网页 access token，请先『取 RT / 刷新状态』")
     emit = log or (lambda *a, **k: None)
 
+    # channel（账单国）出口固定走 IN/KR；update 压价出口保持调用方给的 BR。
+    channel_region = cfg["country"]
+    checkout_proxy = _force_region(checkout_proxy, channel_region)
+
     cffi = _import_cffi()
     session = cffi.Session(impersonate="chrome")
     device_id = str(uuid.uuid4())
     profile = _profile(method)
     accept_language = cfg["accept_language"]
-    stripe_candidates = _unique([update_proxy, checkout_proxy]) or [""]
+    stripe_candidates = _unique([checkout_proxy, update_proxy]) or [""]
 
     try:
         emit("checkout", f"创建 {cfg['label']} checkout", status="running")
@@ -440,64 +482,83 @@ def generate_link(
                        confirm_form, stripe_candidates, accept_language)
         _require_ok(r, "stripe_confirm")
 
-        # approve 与 details 轮询并行：一条路被 blocked，另一条出口可能 approved。
-        emit("approve", "OpenAI 审批并轮询提取链接", status="running")
-        approve_routes = _unique([update_proxy, checkout_proxy]) or [""]
+        # approve 与 details 轮询并行：OpenAI 按出口 IP 逐个 block approve，靠多条
+        # 不同 IN 线路并发命中一个 approved；命中即停。approve 客户端 timeout 不等于
+        # 失败——服务端可能已批准，所以无论 approve 结果如何都继续 IN 出口轮询取链接。
+        exits = _approve_exits(checkout_pool, checkout_proxy, channel_region, approve_workers)
+        emit("approve", f"OpenAI 审批（{len(exits)} 路 {channel_region} 出口并发）", status="running")
+        approved_flag = threading.Event()
+        approve_states: list[str] = []
+        states_lock = threading.Lock()
 
         def approve(proxy: str) -> None:
-            # approve 与主线程的 details 轮询并行，用独立 session 避免共享连接的线程安全问题。
+            # 用独立 session 避免共享连接的线程安全问题。
+            if approved_flag.is_set():
+                return
             sess = cffi.Session(impersonate="chrome")
+            state = "error"
             try:
-                sess.post(
+                resp = sess.post(
                     OAI_APPROVE,
                     headers={**_oai_headers(token, device_id, "/backend-api/payments/checkout/approve"),
-                             "Referer": f"https://chatgpt.com/checkout/{processor}/{cs_id}"},
+                             "Referer": f"https://chatgpt.com/checkout/{processor}/{cs_id}",
+                             "Accept-Language": accept_language,
+                             "Oai-Language": cfg["locale"]},
                     json={"checkout_session_id": cs_id, "processor_entity": processor},
-                    proxies=_proxy_dict(proxy), timeout=40,
+                    proxies=_proxy_dict(proxy), timeout=18,
                 )
-            except Exception:
-                pass
+                try:
+                    state = str((resp.json() or {}).get("result") or resp.status_code).lower()
+                except Exception:
+                    state = str(resp.status_code)
+            except Exception as exc:
+                state = "timeout" if "timeout" in type(exc).__name__.lower() else "error"
             finally:
                 try:
                     sess.close()
                 except Exception:
                     pass
+            with states_lock:
+                approve_states.append(state)
+            if state == "approved":
+                approved_flag.set()
 
         threads = []
-        for i in range(max(1, approve_workers)):
-            t = threading.Thread(target=approve, args=(approve_routes[i % len(approve_routes)],), daemon=True)
+        for i, exit_proxy in enumerate(exits):
+            if approved_flag.is_set():
+                break
+            t = threading.Thread(target=approve, args=(exit_proxy,), daemon=True)
             threads.append(t)
             t.start()
+            time.sleep(0.05 if i < 4 else 0.08)
 
         link = ""
+        poll_proxy = _force_region(checkout_proxy, channel_region)
         deadline = time.time() + max(5, poll_seconds)
         details_params_key = client_session_id
         while time.time() < deadline:
-            for proxy in _unique([update_proxy, checkout_proxy]) or [""]:
-                r = session.get(
-                    f"{STRIPE_API}/payment_pages/{cs_id}",
-                    headers=_stripe_headers(accept_language),
-                    params={
-                        "key": pk, "_stripe_version": STRIPE_VERSION,
-                        "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
-                        "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
-                        "elements_session_client[elements_init_source]": "custom_checkout",
-                        "elements_session_client[referrer_host]": "chatgpt.com",
-                        "elements_session_client[session_id]": elements_session_id,
-                        "elements_session_client[stripe_js_id]": details_params_key,
-                        "elements_session_client[locale]": cfg["locale"],
-                        "elements_session_client[is_aggregation_expected]": "false",
-                        "elements_options_client[saved_payment_method][enable_save]": "never",
-                        "elements_options_client[saved_payment_method][enable_redisplay]": "never",
-                    },
-                    proxies=_proxy_dict(proxy), timeout=30,
-                )
-                if r.ok:
-                    link = _extract_link(r.json(), method)
-                    if link:
-                        break
-            if link:
-                break
+            r = session.get(
+                f"{STRIPE_API}/payment_pages/{cs_id}",
+                headers=_stripe_headers(accept_language),
+                params={
+                    "key": pk, "_stripe_version": STRIPE_VERSION,
+                    "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
+                    "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
+                    "elements_session_client[elements_init_source]": "custom_checkout",
+                    "elements_session_client[referrer_host]": "chatgpt.com",
+                    "elements_session_client[session_id]": elements_session_id,
+                    "elements_session_client[stripe_js_id]": details_params_key,
+                    "elements_session_client[locale]": cfg["locale"],
+                    "elements_session_client[is_aggregation_expected]": "false",
+                    "elements_options_client[saved_payment_method][enable_save]": "never",
+                    "elements_options_client[saved_payment_method][enable_redisplay]": "never",
+                },
+                proxies=_proxy_dict(poll_proxy), timeout=30,
+            )
+            if r.ok:
+                link = _extract_link(r.json(), method)
+                if link:
+                    break
             time.sleep(1)
 
         for t in threads:
@@ -509,6 +570,7 @@ def generate_link(
             "method": method,
             "amount": amount,
             "checkout_session_id": cs_id,
+            "approve_states": list(approve_states),
         }
     finally:
         try:
