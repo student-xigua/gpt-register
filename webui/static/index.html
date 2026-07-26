@@ -14,6 +14,11 @@
     <h1>GPT Outlook Register</h1>
     <span class="sub">纯协议 · Outlook 接码 · <a href="https://www.ransuyun.com/" target="_blank" rel="noopener" class="brand-link">燃速云</a> 驱动</span>
   </div>
+  <nav class="console-nav" aria-label="主导航">
+    <a href="./pool">号池</a>
+    <a href="./accounts">账号管理</a>
+    <span class="active">运行与配置</span>
+  </nav>
   <div class="stats" id="statsBar">
     <span class="pill"><b>0</b> 总计</span>
     <span class="pill ok"><b>0</b> 可用</span>
@@ -98,15 +103,13 @@
     <div id="logBox" class="log"></div>
 
     <div class="tabs">
-      <button class="tab active" data-tab="pool">号池</button>
-      <button class="tab" data-tab="registered">注册结果</button>
-      <button class="tab" data-tab="runs">运行记录</button>
+      <button class="tab active" data-tab="runs">运行记录</button>
       <button class="tab" data-tab="mailcfg">📧 邮箱配置</button>
       <button class="tab" data-tab="smscfg">📱 接码配置</button>
       <button class="tab" data-tab="exportcfg">📤 自动导出</button>
     </div>
 
-    <div class="tab-content" id="tab-pool">
+    <div class="tab-content hidden legacy-data-pane" id="tab-pool">
       <div class="row">
         <select id="poolFilter">
           <option value="">全部</option>
@@ -180,7 +183,7 @@
       </div>
     </div>
 
-    <div class="tab-content hidden" id="tab-runs">
+    <div class="tab-content" id="tab-runs">
       <div class="row">
         <button id="btnRefreshRuns">刷新</button>
       </div>

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>账号管理 · GPT Register</title>
+  <link rel="stylesheet" href="static/workbench.css">
+</head>
+<body>
+<div class="app-shell">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="blocks"></i></span>
+      <span>GPT Register<small>operations desk</small></span>
+    </div>
+    <nav class="nav" aria-label="主导航">
+      <a href="pool"><i data-lucide="inbox"></i>号池</a>
+      <a class="active" href="accounts" aria-current="page"><i data-lucide="users-round"></i>账号管理</a>
+    </nav>
+    <div class="top-actions">
+      <span class="server-state"><i class="server-dot"></i><span id="serverState">服务检查中</span></span>
+      <a class="console-link" href="./"><i data-lucide="terminal-square"></i><span>运行与配置</span></a>
+    </div>
+  </header>
+
+  <main class="page">
+    <div class="page-head">
+      <div class="title-line">
+        <h1>账号管理</h1>
+        <span class="count-note"><b id="totalNote">0</b> 个已注册账号</span>
+      </div>
+      <span class="updated" id="updatedAt">尚未刷新</span>
+    </div>
+
+    <section class="metrics" aria-label="账号概览">
+      <div class="metric"><span class="metric-icon"><i data-lucide="database"></i></span><div><b id="metricTotal">0</b><span>账号总数</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="key-round"></i></span><div><b id="metricRt">0</b><span>已有 OpenAI RT</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="sparkles"></i></span><div><b id="metricPlus">0</b><span>Plus / 可试用</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="circle-dollar-sign"></i></span><div><b id="metricFree">0</b><span>Free 缓存</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="shield-alert"></i></span><div><b id="metricIssues">0</b><span>凭证异常 / 停用</span></div></div>
+    </section>
+
+    <section class="toolbar" aria-label="账号工具栏">
+      <div class="segment" id="filterSegment">
+        <button class="active" data-filter="all">全部</button>
+        <button data-filter="has_rt">有 RT</button>
+        <button data-filter="no_rt">无 RT</button>
+      </div>
+      <button id="refreshBtn" title="刷新列表"><i data-lucide="refresh-cw"></i>刷新</button>
+      <span class="selection-note">已选 <b id="selectedCount">0</b></span>
+      <button id="copyAtBtn" disabled><i data-lucide="copy"></i>复制 AT</button>
+      <button id="copyEmailBtn" disabled><i data-lucide="mail"></i>获取邮箱</button>
+      <button id="acquireRtBtn" disabled><i data-lucide="key"></i>获取 RT</button>
+      <button id="statusSelectedBtn" disabled><i data-lucide="activity"></i>刷新选中状态</button>
+      <button id="statusPageBtn"><i data-lucide="scan-search"></i>刷新当前页</button>
+      <button id="downloadBtn" class="primary" disabled><i data-lucide="download"></i>下载 Sub2API</button>
+      <span class="spacer"></span>
+      <input id="proxyInput" class="control" style="width:210px" placeholder="状态/登录代理（可选）">
+    </section>
+
+    <section class="table-card">
+      <div class="table-scroll" id="tableScroll">
+        <table id="accountsTable">
+          <colgroup>
+            <col style="width:35px"><col style="width:20%"><col style="width:12%">
+            <col style="width:8%"><col style="width:8%"><col style="width:8%">
+            <col style="width:13%"><col>
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="check-cell"><input id="selectAll" type="checkbox" aria-label="全选当前页"></th>
+              <th>账号邮箱</th>
+              <th>套餐状态</th>
+              <th>AT</th>
+              <th>ST</th>
+              <th>RT</th>
+              <th>检查时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <footer class="table-footer">
+        <span class="size-control">每页
+          <select id="pageSize" class="control"><option>20</option><option>50</option><option>100</option></select>
+          条
+        </span>
+        <div class="pager">
+          <button id="prevBtn" aria-label="上一页"><i data-lucide="chevron-left"></i></button>
+          <span class="page-info" id="pageInfo">第 1 / 1 页 · 0 条</span>
+          <button id="nextBtn" aria-label="下一页"><i data-lucide="chevron-right"></i></button>
+        </div>
+      </footer>
+    </section>
+  </main>
+</div>
+
+<div class="modal hidden" id="credentialModal" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="modalTitle">账号凭证</h2>
+      <button id="copyJsonBtn"><i data-lucide="copy"></i>复制 JSON</button>
+      <button id="closeModalBtn" class="icon-action" aria-label="关闭"><i data-lucide="x"></i></button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<aside class="task-drawer hidden" id="taskDrawer">
+  <div class="task-title"><i data-lucide="loader-circle"></i><span id="taskTitle">后台任务</span></div>
+  <div class="task-meta" id="taskMeta"></div>
+  <div class="progress"><span id="taskProgress"></span></div>
+  <div class="task-actions">
+    <button id="taskCloseBtn">收起</button>
+    <button id="taskDownloadBtn" class="primary" hidden><i data-lucide="download"></i>下载 JSON</button>
+  </div>
+</aside>
+
+<div class="toast" id="toast"></div>
+<script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+<script src="static/workbench-common.js"></script>
+<script src="static/accounts.js"></script>
+</body>
+</html>

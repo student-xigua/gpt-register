@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>号池 · GPT Register</title>
+  <link rel="stylesheet" href="static/workbench.css">
+</head>
+<body>
+<div class="app-shell">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="blocks"></i></span>
+      <span>GPT Register<small>operations desk</small></span>
+    </div>
+    <nav class="nav" aria-label="主导航">
+      <a class="active" href="pool" aria-current="page"><i data-lucide="inbox"></i>号池</a>
+      <a href="accounts"><i data-lucide="users-round"></i>账号管理</a>
+    </nav>
+    <div class="top-actions">
+      <span class="server-state"><i class="server-dot"></i><span id="serverState">服务检查中</span></span>
+      <a class="console-link" href="./"><i data-lucide="terminal-square"></i><span>运行与配置</span></a>
+    </div>
+  </header>
+
+  <main class="page">
+    <div class="page-head">
+      <div class="title-line"><h1>号池</h1><span class="count-note"><b id="totalNote">0</b> 个 Outlook 接码号</span></div>
+      <span class="updated" id="updatedAt">尚未刷新</span>
+    </div>
+
+    <section class="metrics" aria-label="号池概览">
+      <div class="metric"><span class="metric-icon"><i data-lucide="database"></i></span><div><b id="metricTotal">0</b><span>总计</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="circle-check"></i></span><div><b id="metricAvailable">0</b><span>Available</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="loader-circle"></i></span><div><b id="metricInUse">0</b><span>In use</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="badge-check"></i></span><div><b id="metricDone">0</b><span>Done</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="triangle-alert"></i></span><div><b id="metricFailed">0</b><span>Failed</span></div></div>
+    </section>
+
+    <section class="toolbar" aria-label="号池工具栏">
+      <select id="statusFilter" class="control">
+        <option value="">全部状态</option><option value="available">available</option>
+        <option value="in_use">in_use</option><option value="done">done</option><option value="failed">failed</option>
+      </select>
+      <button id="refreshBtn"><i data-lucide="refresh-cw"></i>刷新</button>
+      <button id="toggleImportBtn" class="primary"><i data-lucide="file-input"></i>导入四段邮箱</button>
+      <button id="resetFailedBtn"><i data-lucide="rotate-ccw"></i>重试 failed</button>
+      <button id="releaseBtn"><i data-lucide="recycle"></i>释放卡死号</button>
+      <span class="selection-note">已选 <b id="selectedCount">0</b></span>
+      <button id="resetSelectedBtn" disabled><i data-lucide="refresh-ccw"></i>重置选中</button>
+      <button id="deleteSelectedBtn" class="danger" disabled><i data-lucide="trash-2"></i>删除选中</button>
+      <span class="spacer"></span>
+      <select id="bulkStatus" class="control">
+        <option value="">按状态批量删除</option><option value="failed">全部 failed</option>
+        <option value="done">全部 done</option><option value="available">全部 available</option>
+        <option value="in_use">全部 in_use</option><option value="all">全部（危险）</option>
+      </select>
+      <button id="bulkDeleteBtn" class="danger">执行</button>
+    </section>
+
+    <section class="import-panel hidden" id="importPanel">
+      <textarea id="importText" placeholder="每行：email----password----client_id----refresh_token"></textarea>
+      <div class="import-actions">
+        <button id="importBtn" class="primary"><i data-lucide="database-zap"></i>导入号池</button>
+        <button id="cancelImportBtn">取消</button>
+      </div>
+    </section>
+
+    <section class="table-card">
+      <div class="table-scroll">
+        <table id="poolTable">
+          <colgroup><col style="width:35px"><col style="width:30%"><col style="width:12%"><col><col style="width:190px"></colgroup>
+          <thead><tr><th class="check-cell"><input id="selectAll" type="checkbox" aria-label="全选当前页"></th><th>邮箱</th><th>状态</th><th>失败原因 / 重试信息</th><th>操作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <footer class="table-footer">
+        <span class="size-control">每页
+          <select id="pageSize" class="control"><option>20</option><option selected>50</option><option>100</option></select> 条
+        </span>
+        <div class="pager">
+          <button id="prevBtn" aria-label="上一页"><i data-lucide="chevron-left"></i></button>
+          <span class="page-info" id="pageInfo">第 1 / 1 页 · 0 条</span>
+          <button id="nextBtn" aria-label="下一页"><i data-lucide="chevron-right"></i></button>
+        </div>
+      </footer>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+<script src="static/workbench-common.js"></script>
+<script src="static/pool.js"></script>
+</body>
+</html>

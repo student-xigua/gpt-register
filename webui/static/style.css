@@ -60,6 +60,24 @@ header {
   font-size: 9px;
   opacity: 0.6;
 }
+.console-nav {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+}
+.console-nav a,
+.console-nav span {
+  padding: 6px 10px;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: none;
+}
+.console-nav a:hover { color: var(--pink-dark); background: var(--pink-light); }
+.console-nav .active { color: white; background: var(--pink-dark); }
+.legacy-data-pane { display: none !important; }
 
 /* 顶部告警横幅（熔断 / 严重错误） */
 .alert-banner {

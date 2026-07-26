@@ -459,6 +459,30 @@ def count_registered(filter_rt: str = "all") -> int:
     return cur.fetchone()[0]
 
 
+def registered_summary() -> dict:
+    """返回账号管理顶部概览；Plus/Free 来自最近一次状态缓存。"""
+    con = _conn()
+    rows = con.execute(
+        "SELECT refresh_token, extra_json FROM registered"
+    ).fetchall()
+    summary = {"total": len(rows), "has_rt": 0, "plus": 0, "free": 0, "issues": 0}
+    for row in rows:
+        if str(row["refresh_token"] or "").strip():
+            summary["has_rt"] += 1
+        try:
+            extra = json.loads(row["extra_json"] or "{}")
+            status = (extra.get("plus_check") or {}).get("status")
+        except Exception:
+            status = None
+        if status in ("plus_active", "plus_eligible"):
+            summary["plus"] += 1
+        elif status == "free":
+            summary["free"] += 1
+        elif status in ("banned", "credential_invalid", "error"):
+            summary["issues"] += 1
+    return summary
+
+
 def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") -> list[dict]:
     con = _conn()
     if filter_rt == "has_rt":
@@ -524,6 +548,32 @@ def get_registered(email: str) -> Optional[dict]:
             out["extra"] = {}
     out.pop("extra_json", None)
     return out
+
+
+def update_registered_fields(email: str, **fields) -> bool:
+    """只更新已注册账号的指定凭证字段，空值不会意外抹掉已有数据。"""
+    allowed = {
+        "access_token", "session_token", "refresh_token", "id_token",
+        "device_id", "csrf_token", "cookie_header",
+    }
+    updates = {
+        key: value
+        for key, value in fields.items()
+        if key in allowed and value is not None and str(value) != ""
+    }
+    if not updates:
+        return False
+    assignments = ", ".join(f"{key}=?" for key in updates)
+    values = [updates[key] for key in updates]
+    values.append(email.strip().lower())
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            f"UPDATE registered SET {assignments} WHERE email=?",
+            values,
+        )
+        con.commit()
+        return rc.rowcount > 0
 
 
 def delete_registered(email: str) -> bool:

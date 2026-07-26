@@ -17,14 +17,14 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from . import db, registrar  # noqa: E402
+from . import account_ops, db, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 
 # 启动时自动释放卡死的 in_use 号（上次进程崩溃 / 强退留下的）
@@ -282,9 +282,16 @@ def api_runs(limit: int = 50):
 
 @app.get("/api/registered")
 def api_registered(limit: int = 20, offset: int = 0, filter: str = "all"):
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
     items = db.list_registered(limit=limit, offset=offset, filter_rt=filter)
     total = db.count_registered(filter_rt=filter)
-    return {"ok": True, "items": items, "total": total}
+    return {
+        "ok": True,
+        "items": items,
+        "total": total,
+        "summary": db.registered_summary(),
+    }
 
 
 @app.get("/api/registered/{email}")
@@ -292,7 +299,10 @@ def api_registered_one(email: str):
     row = db.get_registered(email)
     if not row:
         raise HTTPException(404, "not found")
-    return {"ok": True, "data": row}
+    return JSONResponse(
+        {"ok": True, "data": row},
+        headers={"Cache-Control": "no-store, private"},
+    )
 
 
 @app.delete("/api/registered/{email}")
@@ -317,6 +327,93 @@ def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
         n = db.delete_registered_by_emails(req.emails)
         return {"ok": True, "deleted": n, "by": "emails"}
     raise HTTPException(400, "需要 emails 或 all=true")
+
+
+# ──────────────────────── 账号管理工作台 ────────────────────────
+
+
+class AccountEmailsReq(BaseModel):
+    emails: list[str] = Field(..., min_length=1, max_length=100, description="账号邮箱列表")
+    proxy: str = Field("", description="可选代理")
+    otp_timeout: int = Field(180, ge=30, le=600)
+
+
+@app.get("/api/account-management/email/{email}")
+def api_account_source(email: str):
+    """返回该账号导入时的原始 Outlook 四段格式。"""
+    row = db.get_account(email)
+    if not row:
+        raise HTTPException(404, "号池中没有该账号的原始邮箱凭据")
+    raw = "----".join(
+        str(row.get(key) or "")
+        for key in ("email", "password", "client_id", "refresh_token")
+    )
+    return JSONResponse(
+        {"ok": True, "email": row["email"], "raw": raw},
+        headers={"Cache-Control": "no-store, private"},
+    )
+
+
+@app.post("/api/account-management/tasks/acquire-rt")
+def api_start_acquire_rt(req: AccountEmailsReq):
+    if not req.emails:
+        raise HTTPException(400, "emails 不能为空")
+    task_id = account_ops.start_rt_login(
+        req.emails,
+        proxy=req.proxy,
+        otp_timeout=req.otp_timeout,
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/account-management/tasks/refresh-status")
+def api_start_status_refresh(req: AccountEmailsReq):
+    if not req.emails:
+        raise HTTPException(400, "emails 不能为空")
+    task_id = account_ops.start_status_refresh(req.emails, proxy=req.proxy)
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/account-management/tasks/sub2-export")
+def api_start_sub2_export(req: AccountEmailsReq):
+    if not req.emails:
+        raise HTTPException(400, "emails 不能为空")
+    task_id, eligible, skipped = account_ops.start_sub2_export(req.emails)
+    if eligible == 0:
+        raise HTTPException(400, "所选账号均无 OpenAI RT，未创建下载")
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "eligible": eligible,
+        "skipped": skipped,
+    }
+
+
+@app.get("/api/account-tasks/{task_id}")
+def api_account_task(task_id: str):
+    task = account_ops.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在或已过期")
+    return {"ok": True, **task}
+
+
+@app.get("/api/account-tasks/{task_id}/download")
+def api_account_task_download(task_id: str):
+    artifact = account_ops.pop_artifact(task_id)
+    if not artifact:
+        raise HTTPException(404, "文件不存在、尚未生成或已经下载")
+    body, filename = artifact
+    safe_filename = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 # ──────────────────────── 邮箱来源配置 ────────────────────────
@@ -596,78 +693,29 @@ class CheckPlusReq(BaseModel):
 
 @app.post("/api/registered/check_plus")
 def api_check_plus(req: CheckPlusReq):
-    """用 access_token 查询账号的 Plus 试用状态。"""
-    try:
-        from curl_cffi import requests as cffi_requests
-    except ImportError:
-        raise HTTPException(500, "curl_cffi 未安装")
-
+    """兼容旧控制台：同步刷新当前账号的缓存状态。"""
     results = {}
     for email in req.emails:
         cred = db.get_registered(email)
         if not cred:
-            results[email] = {"status": "not_found", "label": "未找到"}
-            continue
-        at = (cred.get("access_token") or "").strip()
-        if not at:
-            results[email] = {"status": "no_at", "label": "无AT"}
+            results[email] = {
+                "status": "not_found", "label": "未找到", "checked_at": time.time(),
+            }
             continue
         try:
-            proxies = None
-            proxy = req.proxy.strip()
-            if proxy:
-                proxies = {"https": proxy, "http": proxy}
-            resp = cffi_requests.get(
-                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
-                headers={
-                    "Authorization": f"Bearer {at}",
-                    "Accept": "application/json",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/145.0.0.0 Safari/537.36"
-                    ),
-                },
-                proxies=proxies,
-                impersonate="chrome110",
-                timeout=15,
+            results[email] = account_ops.check_account_status(
+                cred, proxy=req.proxy.strip(),
             )
-            if resp.status_code == 401:
-                results[email] = {"status": "banned", "label": "封号"}
-                continue
-            if resp.status_code != 200:
-                results[email] = {"status": "error", "label": f"HTTP {resp.status_code}"}
-                continue
-            data = resp.json()
-            accts = data.get("accounts", {})
-            if not accts:
-                results[email] = {"status": "error", "label": "无账户数据"}
-                continue
-            info = next(iter(accts.values()))
-            acct = info.get("account", {})
-            ent = info.get("entitlement", {})
-            promo = info.get("eligible_promo_campaigns", {})
-            is_deactivated = acct.get("is_deactivated", False)
-            if is_deactivated:
-                results[email] = {"status": "banned", "label": "封号"}
-                continue
-            plan = acct.get("plan_type", "free")
-            has_sub = ent.get("has_active_subscription", False)
-            has_plus_promo = "plus" in promo and promo["plus"].get("id") == "plus-1-month-free"
-            if plan == "plus" or has_sub:
-                results[email] = {"status": "plus_active", "label": "Plus生效中"}
-            elif has_plus_promo:
-                results[email] = {"status": "plus_eligible", "label": "可领Plus试用"}
-            else:
-                results[email] = {"status": "free", "label": "Free"}
         except Exception as e:
-            results[email] = {"status": "error", "label": str(e)[:60]}
+            results[email] = {
+                "status": "error",
+                "label": account_ops._safe_error(e),
+                "checked_at": time.time(),
+            }
 
-    import time as _time
-    checked_at = _time.time()
     for email, info in results.items():
-        if info["status"] not in ("not_found", "no_at"):
-            db.update_plus_check(email, {**info, "checked_at": checked_at})
+        if info["status"] != "not_found":
+            db.update_plus_check(email, info)
 
     return {"ok": True, "results": results}
 
@@ -766,6 +814,16 @@ async def api_auto_stream(request: Request):
 @app.get("/")
 def root():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/pool")
+def pool_page():
+    return FileResponse(STATIC_DIR / "pool.html")
+
+
+@app.get("/accounts")
+def accounts_page():
+    return FileResponse(STATIC_DIR / "accounts.html")
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

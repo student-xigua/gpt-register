@@ -168,14 +168,8 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -
     )
 
     if resp.status_code != 200:
-        body_text = ""
-        try:
-            body_text = (resp.text or "")[:300]
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"OpenAI token 刷新失败 HTTP {resp.status_code}: {body_text}"
-        )
+        # 上游错误正文有时会回显 token 或内部诊断字段，不进入异常/日志。
+        raise RuntimeError(f"OpenAI token 刷新失败 HTTP {resp.status_code}")
 
     try:
         data = resp.json()
@@ -183,7 +177,7 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -
         raise RuntimeError("OpenAI token 刷新返回非 JSON")
 
     if not isinstance(data, dict) or not data.get("access_token"):
-        raise RuntimeError(f"OpenAI token 刷新返回无 access_token: {str(data)[:200]}")
+        raise RuntimeError("OpenAI token 刷新返回缺少 access_token")
 
     return data
 

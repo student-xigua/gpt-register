@@ -1338,6 +1338,8 @@ $("#btnTestSub2api").addEventListener("click", (e) => {
 // ──────────────────────── 启动 ────────────────────────
 
 _loadForm();
+const initialEmail = new URLSearchParams(location.search).get("email");
+if (initialEmail) $("#regEmail").value = initialEmail;
 _bindAutoSave();
 refreshStats();
 refreshPool();
