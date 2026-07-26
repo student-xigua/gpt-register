@@ -107,6 +107,8 @@
       <button class="tab" data-tab="mailcfg">📧 邮箱配置</button>
       <button class="tab" data-tab="smscfg">📱 接码配置</button>
       <button class="tab" data-tab="exportcfg">📤 自动导出</button>
+      <button class="tab" data-tab="upicfg">🇮🇳 UPI</button>
+      <button class="tab" data-tab="kakaocfg">🇰🇷 Kakao</button>
     </div>
 
     <div class="tab-content hidden legacy-data-pane" id="tab-pool">
@@ -414,6 +416,58 @@
         <div class="row">
           <button id="btnSaveExportCfg" class="primary">💾 保存配置</button>
           <span id="exportCfgResult" class="result"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-content hidden" id="tab-upicfg">
+      <h3 style="margin:0 0 12px;color:var(--pink-dark)">🇮🇳 UPI 提链代理池</h3>
+      <p class="hint">
+        账号管理页每行的 <b>UPI</b> 按钮会用这里的代理跑一遍提链流程。<br>
+        每行一个代理，运行时随机取一条。格式：<code>host:port:user:pass</code> 或 <code>http://user:pass@host:port</code>。
+      </p>
+      <div class="form">
+        <label>代理池1 <small>（账单出口 · 印度 IN 住宅，必填）</small>
+          <textarea id="upi_pool1" rows="4" placeholder="host:port:user:pass&#10;每行一个印度住宅代理" style="font-family:monospace;font-size:12px"></textarea>
+        </label>
+        <p class="hint" style="margin:-4px 0 8px">
+          👉 代理池1 跑 <b>OpenAI checkout + Stripe 初始化</b>，决定账单/风控出口国家——UPI 必须走印度 IN 才会出现 UPI 付款方式。
+        </p>
+        <label>代理池2 <small>（压价出口 · 巴西 BR 住宅，留空则复用代理池1）</small>
+          <textarea id="upi_pool2" rows="4" placeholder="host:port:user:pass&#10;每行一个巴西住宅代理（可留空）" style="font-family:monospace;font-size:12px"></textarea>
+        </label>
+        <p class="hint" style="margin:-4px 0 8px">
+          👉 代理池2 跑 <b>checkout/update 促销压价（压到 0 INR）</b>这一步；换付款方式 / 确认 / 轮询取链接会在池1、池2之间轮流尝试。
+        </p>
+        <div class="row">
+          <button id="btnSaveUpiCfg" class="primary">💾 保存配置</button>
+          <span id="upiCfgResult" class="result"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-content hidden" id="tab-kakaocfg">
+      <h3 style="margin:0 0 12px;color:var(--pink-dark)">🇰🇷 Kakao 提链代理池</h3>
+      <p class="hint">
+        账号管理页每行的 <b>Kakao</b> 按钮会用这里的代理跑一遍提链流程。<br>
+        每行一个代理，运行时随机取一条。格式：<code>host:port:user:pass</code> 或 <code>http://user:pass@host:port</code>。
+      </p>
+      <div class="form">
+        <label>代理池1 <small>（账单出口 · 韩国 KR 住宅，必填）</small>
+          <textarea id="kakao_pool1" rows="4" placeholder="host:port:user:pass&#10;每行一个韩国住宅代理" style="font-family:monospace;font-size:12px"></textarea>
+        </label>
+        <p class="hint" style="margin:-4px 0 8px">
+          👉 代理池1 跑 <b>OpenAI checkout + Stripe 初始化</b>，决定账单/风控出口国家——Kakao Pay 需走韩国 KR 才会出现该付款方式。
+        </p>
+        <label>代理池2 <small>（压价出口，留空则复用代理池1）</small>
+          <textarea id="kakao_pool2" rows="4" placeholder="host:port:user:pass&#10;每行一个压价出口代理（可留空）" style="font-family:monospace;font-size:12px"></textarea>
+        </label>
+        <p class="hint" style="margin:-4px 0 8px">
+          👉 代理池2 跑 <b>checkout/update 促销压价</b>这一步；换付款方式 / 确认 / 轮询取链接会在池1、池2之间轮流尝试。
+        </p>
+        <div class="row">
+          <button id="btnSaveKakaoCfg" class="primary">💾 保存配置</button>
+          <span id="kakaoCfgResult" class="result"></span>
         </div>
       </div>
     </div>

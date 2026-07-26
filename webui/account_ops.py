@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import threading
 import time
@@ -19,7 +20,7 @@ from config import Config
 from log_safety import redact_sensitive_text
 from mail_outlook import OutlookMailProvider
 
-from . import db, exporter, twofa
+from . import db, exporter, link_gen, twofa
 from .sms_runtime import build_sms_controller
 
 logger = logging.getLogger("webui.account_ops")
@@ -37,6 +38,11 @@ PHASE_LABELS = {
     "activate": "激活 2FA",
     "persist": "保存 RT",
     "download": "生成下载文件",
+    "checkout": "创建 checkout",
+    "stripe_init": "初始化 Stripe",
+    "update": "应用促销价",
+    "confirm": "确认付款方式",
+    "approve": "审批并提取链接",
     "complete": "任务完成",
     "failed": "任务失败",
 }
@@ -370,6 +376,100 @@ def start_sub2_export(emails: list[str]) -> tuple[str, int, int]:
         )
 
     return _run_async(task, worker), len(eligible), task.skipped
+
+
+def _pick_proxy(pool_text: str) -> str:
+    """从多行代理池里随机取一行（忽略空行与 # 注释）。"""
+    lines = [
+        ln.strip()
+        for ln in str(pool_text or "").splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    return random.choice(lines) if lines else ""
+
+
+def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) -> str:
+    """后台为账号提炼 UPI / Kakao 付款链接，成功后写入 extra_json.links。"""
+    method = (method or "").strip().lower()
+    if method not in link_gen.METHODS:
+        raise ValueError(f"不支持的支付方式: {method}")
+    requested = list(dict.fromkeys(_clean_email(e) for e in emails if _clean_email(e)))
+    if not requested:
+        raise ValueError("emails 不能为空")
+
+    label = link_gen.METHODS[method]["label"]
+    pools = db.get_proxy_pools()
+    pool1 = pools.get(f"{method}_pool1", "")
+    pool2 = pools.get(f"{method}_pool2", "")
+    if not _pick_proxy(pool1):
+        raise AccountOperationError(
+            "PROXY_POOL_EMPTY",
+            f"{label} 代理池1 为空，无法提炼链接。",
+            f"请先在「{label}」配置标签页填写代理池1。",
+        )
+
+    task = _new_task("gen_link", len(requested))
+
+    def worker(state: AccountTask) -> None:
+        for email in requested:
+            state.current_email = email
+            state.message = f"正在提炼 {state.completed + 1}/{state.total}"
+
+            def progress(phase, detail, *, status="running", code=""):
+                state.set_phase(phase, detail, status=status, email=email, code=code)
+
+            try:
+                cred = db.get_registered(email)
+                if not cred:
+                    raise AccountOperationError(
+                        "ACCOUNT_NOT_FOUND",
+                        "账号不在已注册列表里。",
+                        "请先完成注册或导入该账号的凭证后重试。",
+                    )
+                checkout_proxy = _pick_proxy(pool1)
+                update_proxy = _pick_proxy(pool2) or checkout_proxy
+                result = link_gen.generate_link(
+                    str(cred.get("access_token") or ""),
+                    method,
+                    checkout_proxy=checkout_proxy,
+                    update_proxy=update_proxy,
+                    poll_seconds=poll_seconds,
+                    log=progress,
+                )
+                link = str(result.get("link") or "").strip()
+                if not link:
+                    raise AccountOperationError(
+                        "LINK_NOT_FOUND",
+                        f"未能提炼到 {label} 链接（金额 {result.get('amount')}）。",
+                        "可换一个代理节点或稍后重试。",
+                    )
+                db.update_registered_link(email, method, link)
+                state.succeeded += 1
+                state.results[email] = {
+                    "status": "ok",
+                    "code": "LINK_OK",
+                    "label": f"{label} 链接已生成",
+                    "link": link,
+                }
+                progress("complete", f"{label} 链接已生成", status="success")
+            except Exception as exc:
+                state.failed += 1
+                error = _error_payload(exc)
+                state.errors.append({"email": email, **error})
+                state.results[email] = {"status": "error", **error}
+                if error["action"] and not state.action_required:
+                    state.action_required = error["action"]
+                state.set_phase(
+                    "failed", error["message"], status="error",
+                    email=email, code=error["code"],
+                )
+            finally:
+                state.completed += 1
+        state.message = (
+            f"{label} 链接生成成功 {state.succeeded} 个，失败 {state.failed} 个"
+        )
+
+    return _run_async(task, worker)
 
 
 def _login_existing_for_rt(

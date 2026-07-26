@@ -583,13 +583,17 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
     for r in cur.fetchall():
         d = dict(r)
         plus = None
+        links = {}
         if d.get("extra_json"):
             try:
                 extra = json.loads(d["extra_json"])
                 plus = extra.get("plus_check")
+                if isinstance(extra.get("links"), dict):
+                    links = extra["links"]
             except Exception:
                 pass
         d["plus_check"] = plus
+        d["links"] = links
         d.pop("extra_json", None)
         rows.append(d)
     return rows
@@ -679,6 +683,36 @@ def update_registered_fields(email: str, **fields) -> bool:
         )
         con.commit()
         return rc.rowcount > 0
+
+
+def update_registered_link(email: str, method: str, link: str) -> None:
+    """把提炼到的 UPI / Kakao 付款链接写入 extra_json.links[method]。
+
+    只存链接本体与生成时间戳（用于前端判断是否过期），不动其它字段。
+    """
+    email = email.lower()
+    method = str(method or "").strip().lower()
+    if not method:
+        return
+    con = _conn()
+    row = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,)).fetchone()
+    if not row:
+        return
+    extra = {}
+    if row["extra_json"]:
+        try:
+            extra = json.loads(row["extra_json"])
+        except Exception:
+            extra = {}
+    links = extra.get("links") if isinstance(extra.get("links"), dict) else {}
+    links[method] = {"link": str(link or ""), "at": time.time()}
+    extra["links"] = links
+    with _lock:
+        con.execute(
+            "UPDATE registered SET extra_json=? WHERE email=?",
+            (json.dumps(extra, ensure_ascii=False), email),
+        )
+        con.commit()
 
 
 def delete_registered(email: str) -> bool:
@@ -802,6 +836,24 @@ def save_mail_config(data: dict) -> None:
 def get_cf_admin_token() -> str:
     """内部用：拿明文 admin_token。"""
     return get_setting("cf_admin_token", "")
+
+
+# ──────────────────────── 提链代理池（UPI / Kakao） ────────────────────────
+
+# 每个支付方式两个池：pool1=账单国出口（UPI 印度 / Kakao 韩国），pool2=压价出口（通常巴西）。
+# 存多行文本，一行一个代理，任务运行时随机取一行。
+PROXY_POOL_KEYS = ("upi_pool1", "upi_pool2", "kakao_pool1", "kakao_pool2")
+
+
+def get_proxy_pools() -> dict:
+    """返回 UPI / Kakao 提链用的代理池（明文，供页面编辑；整站在 basic auth 之后）。"""
+    return {key: get_setting(key, "") for key in PROXY_POOL_KEYS}
+
+
+def save_proxy_pools(data: dict) -> None:
+    for key in PROXY_POOL_KEYS:
+        if key in data:
+            set_setting(key, str(data[key] or "").strip())
 
 
 # ──────────────────────── SMS 接码配置 ────────────────────────

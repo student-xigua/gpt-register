@@ -243,6 +243,7 @@ $$(".tab").forEach((t) => {
     if (t.dataset.tab === "mailcfg") loadMailConfig();
     if (t.dataset.tab === "smscfg") loadSmsConfig();
     if (t.dataset.tab === "exportcfg") loadExportConfig();
+    if (t.dataset.tab === "upicfg" || t.dataset.tab === "kakaocfg") loadProxyPools();
   });
 });
 
@@ -1279,6 +1280,39 @@ async function loadExportConfig() {
     console.error("loadExportConfig:", e);
   }
 }
+
+// ── UPI / Kakao 提链代理池 ──
+const PROXY_POOL_KEYS = ["upi_pool1", "upi_pool2", "kakao_pool1", "kakao_pool2"];
+
+async function loadProxyPools() {
+  try {
+    const { config } = await api("/api/settings/proxy-pools");
+    for (const key of PROXY_POOL_KEYS) {
+      const el = $("#" + key);
+      if (el) el.value = config[key] || "";
+    }
+  } catch (e) {
+    console.error("loadProxyPools:", e);
+  }
+}
+
+async function saveProxyPools(keys, resultId) {
+  const body = {};
+  keys.forEach((key) => { body[key] = $("#" + key).value; });
+  const el = $("#" + resultId);
+  try {
+    await api("/api/settings/proxy-pools", { method: "POST", body: JSON.stringify(body) });
+    el.textContent = "✅ 保存成功";
+    el.className = "result ok";
+  } catch (e) {
+    el.textContent = "❌ " + e.message;
+    el.className = "result bad";
+  }
+  setTimeout(() => { el.textContent = ""; }, 3500);
+}
+
+$("#btnSaveUpiCfg")?.addEventListener("click", () => saveProxyPools(["upi_pool1", "upi_pool2"], "upiCfgResult"));
+$("#btnSaveKakaoCfg")?.addEventListener("click", () => saveProxyPools(["kakao_pool1", "kakao_pool2"], "kakaoCfgResult"));
 
 $("#btnSaveExportCfg").addEventListener("click", async () => {
   const cpaKeyInput = $("#cpaMgmtKey").value.trim();

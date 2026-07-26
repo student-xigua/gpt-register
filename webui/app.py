@@ -471,6 +471,43 @@ def api_start_sub2_export(req: AccountEmailsReq):
     }
 
 
+class LinkGenReq(BaseModel):
+    emails: list[str] = Field(..., min_length=1, max_length=100, description="账号邮箱列表")
+    method: str = Field(..., description="upi / kakao")
+
+
+@app.post("/api/account-management/tasks/gen-link")
+def api_start_gen_link(req: LinkGenReq):
+    method = (req.method or "").strip().lower()
+    if method not in {"upi", "kakao"}:
+        raise HTTPException(400, "method 必须是 upi 或 kakao")
+    try:
+        task_id = account_ops.start_link_gen(req.emails, method)
+    except account_ops.AccountOperationError as exc:
+        raise HTTPException(400, f"{exc}（{exc.action}）" if exc.action else str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "task_id": task_id}
+
+
+@app.get("/api/settings/proxy-pools")
+def api_get_proxy_pools():
+    return {"ok": True, "config": db.get_proxy_pools()}
+
+
+class SaveProxyPoolsReq(BaseModel):
+    upi_pool1: Optional[str] = None
+    upi_pool2: Optional[str] = None
+    kakao_pool1: Optional[str] = None
+    kakao_pool2: Optional[str] = None
+
+
+@app.post("/api/settings/proxy-pools")
+def api_save_proxy_pools(req: SaveProxyPoolsReq):
+    db.save_proxy_pools(req.model_dump(exclude_none=True))
+    return {"ok": True}
+
+
 @app.get("/api/account-tasks/{task_id}")
 def api_account_task(task_id: str):
     task = account_ops.get_task(task_id)

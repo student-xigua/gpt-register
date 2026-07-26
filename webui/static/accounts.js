@@ -1,5 +1,8 @@
 const { api, appUrl, copyText, escapeHtml, fmtTime, initIcons, setToast } = window.Workbench;
 const $ = selector => document.querySelector(selector);
+// Stripe 托管付款链接有效期有限，超过这个时长就当过期，点击按钮重新生成。
+const LINK_TTL_MS = 24 * 3600 * 1000;
+const LINK_LABELS = { upi: "UPI", kakao: "Kakao" };
 const state = {
   page: 1,
   pageSize: 20,
@@ -10,6 +13,7 @@ const state = {
   taskTimer: null,
   activeRtEmails: new Set(),
   active2faEmails: new Set(),
+  activeLinkEmails: new Set(),
   modalData: null,
 };
 
@@ -54,6 +58,21 @@ function tokenButton(row, field, length) {
   return `<button class="token-btn present" data-action="copy-token" data-email="${escapeHtml(row.email)}" data-field="${field}" title="复制 ${short}">${short} · ${length}</button>`;
 }
 
+function linkButton(row, method) {
+  const label = LINK_LABELS[method];
+  if (state.activeLinkEmails.has(`${method}:${row.email}`)) {
+    return `<button class="text-action" disabled>${label}…</button>`;
+  }
+  const info = row.links?.[method];
+  const fresh = info?.link && (Date.now() - Number(info.at) * 1000 < LINK_TTL_MS);
+  if (fresh) {
+    // 生成后不占额外空间：链接放 title 悬浮显示，点击即复制。
+    return `<button class="text-action bound" data-action="copy-link" data-method="${method}" data-email="${escapeHtml(row.email)}" title="${escapeHtml(info.link)}&#10;点击复制">${label} ✓</button>`;
+  }
+  const tip = info?.link ? `${label} 链接已过期，点击重新生成` : `点击生成 ${label} 付款链接`;
+  return `<button class="text-action" data-action="gen-link" data-method="${method}" data-email="${escapeHtml(row.email)}" title="${tip}">${label}</button>`;
+}
+
 function renderRows() {
   const body = $("#accountsTable tbody");
   if (!state.rows.length) {
@@ -81,6 +100,8 @@ function renderRows() {
         <button class="text-action" data-action="status" data-email="${escapeHtml(row.email)}" title="实时刷新账号状态">状态</button>
         <button class="text-action" data-action="acquire-rt" data-email="${escapeHtml(row.email)}" title="${rtBusy ? "RT 获取任务进行中" : "重新 OTP 登录获取 RT"}" ${rtBusy ? "disabled" : ""}>${rtBusy ? "处理中" : "取 RT"}</button>
         <button class="text-action${twoFaBound ? " bound" : ""}" data-action="${twoFaBound ? "copy-2fa" : "bind-2fa"}" data-email="${escapeHtml(row.email)}" title="${twoFaBusy ? "2FA 绑定任务进行中" : twoFaBound ? "复制 账号----密码----2FA 密钥" : "邮箱重认证后绑定 2FA"}" ${twoFaBusy ? "disabled" : ""}>${twoFaBusy ? "处理中" : twoFaBound ? "2FA" : "绑 2FA"}</button>
+        ${linkButton(row, "upi")}
+        ${linkButton(row, "kakao")}
         <button class="icon-action" data-action="download" data-email="${escapeHtml(row.email)}" title="下载 Sub2API JSON" ${row.rt_len ? "" : "disabled"}><i data-lucide="download"></i></button>
         <button class="icon-action danger" data-action="delete" data-email="${escapeHtml(row.email)}" title="删除账号"><i data-lucide="trash-2"></i></button>
       </div></td>
@@ -217,6 +238,17 @@ async function startTask(path, emails, label) {
   watchTask(result.task_id, label, busySet ? { set: busySet, emails } : null, emails);
 }
 
+async function startLinkTask(email, method) {
+  const key = `${method}:${email}`;
+  const result = await api("api/account-management/tasks/gen-link", {
+    method: "POST",
+    body: JSON.stringify({ emails: [email], method }),
+  });
+  state.activeLinkEmails.add(key);
+  renderRows();
+  watchTask(result.task_id, `生成 ${LINK_LABELS[method]} 链接`, { set: state.activeLinkEmails, emails: [key] }, [email]);
+}
+
 function renderTaskEvents(events = []) {
   const visible = events.slice(-8);
   $("#taskEvents").innerHTML = visible.map(event => `
@@ -343,6 +375,14 @@ $("#accountsTable").addEventListener("click", async event => {
       await startTask("api/account-management/tasks/refresh-status", [email], "刷新账号状态");
     } else if (action === "acquire" || action === "acquire-rt") {
       await startTask("api/account-management/tasks/acquire-rt", [email], "重新 OTP 登录获取 RT");
+    } else if (action === "copy-link") {
+      const method = button.dataset.method;
+      const link = state.rows.find(row => row.email === email)?.links?.[method]?.link;
+      if (!link) { setToast("链接不存在，请重新生成", "bad"); return; }
+      await copyText(link);
+      setToast(`${LINK_LABELS[method]} 链接已复制`, "ok");
+    } else if (action === "gen-link") {
+      await startLinkTask(email, button.dataset.method);
     } else if (action === "download") {
       await startTask("api/account-management/tasks/sub2-export", [email], "生成 Sub2API JSON");
     } else if (action === "delete") {
