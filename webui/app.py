@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from log_safety import install_sensitive_data_filter  # noqa: E402
+from log_safety import setup_app_logging  # noqa: E402
 from . import account_ops, db, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 
@@ -36,12 +36,7 @@ try:
 except Exception as _e:
     logging.getLogger("webui").warning(f"[startup] release_stale 失败: {_e}")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
-install_sensitive_data_filter()
+setup_app_logging(level=logging.INFO)
 logger = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
