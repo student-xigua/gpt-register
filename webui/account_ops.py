@@ -737,6 +737,11 @@ def check_account_status(
     plan = str(account.get("plan_type") or "free").lower()
     has_subscription = bool(entitlement.get("has_active_subscription"))
     plus_promo = promo.get("plus") if isinstance(promo.get("plus"), dict) else {}
+    # 优惠套餐：OpenAI 对促销订阅返回 plan_type=chatgptplusplan_promo（含 "promo"）。
+    # 它本质是折扣版 Plus，必须在 plus_active 之前判定，否则会被 has_subscription
+    # 吞成普通 "Plus"，或在无订阅标记时误判成 Free。
+    if "promo" in plan:
+        return {"status": "plus_promo", "label": "优惠", "checked_at": checked_at}
     if plan == "plus" or has_subscription:
         return {"status": "plus_active", "label": "Plus", "checked_at": checked_at}
     if plus_promo.get("id") == "plus-1-month-free":

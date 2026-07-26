@@ -474,7 +474,7 @@ def registered_summary() -> dict:
             status = (extra.get("plus_check") or {}).get("status")
         except Exception:
             status = None
-        if status in ("plus_active", "plus_eligible"):
+        if status in ("plus_active", "plus_promo", "plus_eligible"):
             summary["plus"] += 1
         elif status == "free":
             summary["free"] += 1

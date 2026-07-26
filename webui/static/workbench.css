@@ -145,8 +145,9 @@ th {
   text-transform: uppercase;
   letter-spacing: .055em;
 }
-td { height: 40px; padding: 4px 8px; border-bottom: 1px solid #e7ebe9; vertical-align: middle; overflow: hidden; }
-tbody tr:hover td { background: #fbfcfb; }
+td { height: 40px; padding: 4px 8px; border-bottom: 1px solid #e7ebe9; vertical-align: middle; overflow: hidden; transition: background .12s ease; }
+tbody tr:nth-child(even) td { background: #f9fbfa; }
+tbody tr:hover td { background: #eef4f0; }
 .check-cell { width: 35px; text-align: center; }
 input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--blue); }
 .truncate { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -156,6 +157,7 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--blue); }
 .badge::before { content: ""; width: 5px; height: 5px; flex: 0 0 5px; margin-right: 5px; border-radius: 50%; background: currentColor; }
 .badge.unknown, .badge.no_at, .badge.not_found { color: #6f7a75; background: #eef1ef; }
 .badge.plus_active, .badge.done { color: var(--blue); background: var(--blue-soft); }
+.badge.plus_promo { color: #7a2ea8; background: #f4ebfc; }
 .badge.plus_eligible, .badge.available { color: var(--green); background: var(--green-soft); }
 .badge.free, .badge.in_use { color: var(--amber); background: var(--amber-soft); }
 .badge.banned, .badge.failed, .badge.error, .badge.credential_invalid { color: var(--red); background: var(--red-soft); }
