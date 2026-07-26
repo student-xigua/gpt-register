@@ -1,15 +1,23 @@
-const { api, appUrl, escapeHtml, fmtTime, initIcons, setToast } = window.Workbench;
+const { api, appUrl, copyText, escapeHtml, fmtTime, initIcons, setToast } = window.Workbench;
 const $ = selector => document.querySelector(selector);
-const state = { page: 1, pageSize: 50, total: 0, rows: [], selected: new Set() };
+const state = {
+  page: 1, pageSize: 50, total: 0, search: "", registered: "",
+  rows: [], selected: new Set(), fetchingCode: new Set(),
+};
 
 function pages() { return Math.max(1, Math.ceil(state.total / state.pageSize)); }
 function selectedEmails() { return [...state.selected]; }
+
+function rawAccountLine(row) {
+  return [row.email, row.password || "", row.client_id || "", row.refresh_token || ""].join("----");
+}
 
 function updateSelection() {
   const count = state.selected.size;
   $("#selectedCount").textContent = count;
   $("#resetSelectedBtn").disabled = count === 0;
   $("#deleteSelectedBtn").disabled = count === 0;
+  $("#copySelectedBtn").disabled = count === 0;
   const visible = state.rows.map(row => row.email);
   $("#selectAll").checked = visible.length > 0 && visible.every(email => state.selected.has(email));
   $("#selectAll").indeterminate = visible.some(email => state.selected.has(email)) && !$("#selectAll").checked;
@@ -18,19 +26,23 @@ function updateSelection() {
 function renderRows() {
   const body = $("#poolTable tbody");
   if (!state.rows.length) {
-    body.innerHTML = `<tr><td class="empty" colspan="5"><i data-lucide="inbox"></i> 当前筛选下暂无邮箱</td></tr>`;
+    body.innerHTML = `<tr><td class="empty" colspan="6"><i data-lucide="inbox"></i> 当前筛选下暂无邮箱</td></tr>`;
     initIcons();
     return;
   }
   body.innerHTML = state.rows.map(row => {
     const canReset = ["done", "failed"].includes(row.status);
+    const fetching = state.fetchingCode.has(row.email);
     return `<tr>
       <td class="check-cell"><input class="row-check" type="checkbox" data-email="${escapeHtml(row.email)}" ${state.selected.has(row.email) ? "checked" : ""}></td>
       <td><span class="truncate email" title="${escapeHtml(row.email)}">${escapeHtml(row.email)}</span><span class="subline">导入 ${fmtTime(row.imported_at)}</span></td>
       <td><span class="badge ${escapeHtml(row.status)}">${escapeHtml(row.status)}</span></td>
+      <td><span class="badge ${row.is_registered ? "registered" : "unregistered"}">${row.is_registered ? "已注册" : "未注册"}</span></td>
       <td><span class="truncate" title="${escapeHtml(row.fail_reason || "")}">${escapeHtml(row.fail_reason || "—")}</span></td>
       <td><div class="actions">
         <a href="${appUrl(`?email=${encodeURIComponent(row.email)}`)}" title="到控制台使用此邮箱"><button class="text-action"><i data-lucide="play"></i>使用</button></a>
+        <button class="text-action" data-action="fetch-code" data-email="${escapeHtml(row.email)}" title="从该邮箱现取一次最近的验证码" ${fetching ? "disabled" : ""}>${fetching ? "取码中" : "接码"}</button>
+        <button class="icon-action" data-action="copy" data-email="${escapeHtml(row.email)}" title="复制账号（四段邮箱）"><i data-lucide="copy"></i></button>
         <button class="icon-action" data-action="reset" data-email="${escapeHtml(row.email)}" title="重置为 available" ${canReset ? "" : "disabled"}><i data-lucide="rotate-ccw"></i></button>
         <button class="icon-action danger" data-action="delete" data-email="${escapeHtml(row.email)}" title="删除"><i data-lucide="trash-2"></i></button>
       </div></td>
@@ -42,10 +54,12 @@ function renderRows() {
 async function refresh(reset = false) {
   if (reset) state.page = 1;
   const status = $("#statusFilter").value;
+  const search = state.search;
+  const registered = $("#registeredFilter").value;
   const offset = (state.page - 1) * state.pageSize;
   try {
     const [list, statsResult] = await Promise.all([
-      api(`api/accounts?status=${encodeURIComponent(status)}&limit=${state.pageSize}&offset=${offset}`),
+      api(`api/accounts?status=${encodeURIComponent(status)}&search=${encodeURIComponent(search)}&registered=${encodeURIComponent(registered)}&limit=${state.pageSize}&offset=${offset}`),
       api("api/stats"),
     ]);
     state.rows = list.items;
@@ -64,6 +78,7 @@ async function refresh(reset = false) {
     $("#metricInUse").textContent = stats.in_use || 0;
     $("#metricDone").textContent = stats.done || 0;
     $("#metricFailed").textContent = stats.failed || 0;
+    $("#metricRegistered").textContent = stats.registered || 0;
     $("#totalNote").textContent = stats.total || 0;
     $("#updatedAt").textContent = `列表刷新 ${new Date().toLocaleTimeString("zh-CN", {hour:"2-digit", minute:"2-digit"})}`;
     $("#serverState").textContent = "服务正常";
@@ -94,6 +109,16 @@ async function deleteSelected(emails) {
 
 $("#refreshBtn").addEventListener("click", () => refresh());
 $("#statusFilter").addEventListener("change", () => { state.selected.clear(); refresh(true); });
+$("#registeredFilter").addEventListener("change", () => { state.selected.clear(); refresh(true); });
+let searchTimer = null;
+$("#searchInput").addEventListener("input", event => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    state.search = event.target.value.trim();
+    state.selected.clear();
+    refresh(true);
+  }, 300);
+});
 $("#pageSize").addEventListener("change", event => {
   state.pageSize = Number(event.target.value);
   state.selected.clear();
@@ -119,20 +144,49 @@ $("#poolTable").addEventListener("click", async event => {
   const button = event.target.closest("button[data-action]");
   if (!button || button.disabled) return;
   const email = button.dataset.email;
+  const action = button.dataset.action;
   try {
-    if (button.dataset.action === "reset") {
+    if (action === "reset") {
       await api(`api/accounts/reset/${encodeURIComponent(email)}`, { method: "POST" });
       setToast(`${email} 已重置`, "ok");
-    } else if (button.dataset.action === "delete") {
+    } else if (action === "delete") {
       if (!confirm(`删除 ${email}？`)) return;
       await api(`api/accounts/${encodeURIComponent(email)}`, { method: "DELETE" });
       state.selected.delete(email);
       setToast(`${email} 已删除`, "ok");
+    } else if (action === "copy") {
+      const row = state.rows.find(r => r.email === email);
+      if (!row) throw new Error("找不到该行数据");
+      await copyText(rawAccountLine(row));
+      setToast(`已复制 ${email} 的四段邮箱`, "ok");
+      return;
+    } else if (action === "fetch-code") {
+      state.fetchingCode.add(email);
+      renderRows();
+      try {
+        const result = await api(`api/accounts/${encodeURIComponent(email)}/fetch_code`, { method: "POST" });
+        await copyText(result.code);
+        setToast(`验证码 ${result.code}（已复制）`, "ok");
+      } finally {
+        state.fetchingCode.delete(email);
+        renderRows();
+      }
+      return;
     }
     await refresh();
   } catch (error) {
     setToast(error.message, "bad");
   }
+});
+
+$("#copySelectedBtn").addEventListener("click", async () => {
+  const emails = selectedEmails();
+  const rows = state.rows.filter(row => emails.includes(row.email));
+  if (!rows.length) return setToast("所选账号不在当前页，请翻到对应页再复制", "bad");
+  try {
+    await copyText(rows.map(rawAccountLine).join("\n"));
+    setToast(`已复制 ${rows.length} 条四段邮箱`, "ok");
+  } catch (error) { setToast(error.message, "bad"); }
 });
 
 $("#resetSelectedBtn").addEventListener("click", () => {

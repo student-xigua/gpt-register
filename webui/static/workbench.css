@@ -89,6 +89,7 @@ h1 { margin: 0; font-family: "Avenir Next", "PingFang SC", sans-serif; font-size
 .count-note, .updated { color: var(--muted); font-size: 11px; }
 
 .metrics { flex: 0 0 52px; display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.metrics.cols-6 { grid-template-columns: repeat(6, minmax(100px, 1fr)); }
 .metric { display: flex; align-items: center; gap: 9px; padding: 7px 12px; border-right: 1px solid var(--line); min-width: 0; }
 .metric:last-child { border-right: 0; }
 .metric-icon { width: 29px; height: 29px; flex: 0 0 29px; display: grid; place-items: center; border-radius: 6px; background: var(--surface-muted); }
@@ -113,6 +114,7 @@ h1 { margin: 0; font-family: "Avenir Next", "PingFang SC", sans-serif; font-size
 .toolbar .spacer { flex: 1 1 0; }
 /* 代理输入框可伸缩：窄屏先让它变窄留在同一行，宽屏再撑回原宽度 */
 .toolbar #proxyInput { flex: 1 1 140px; min-width: 120px; max-width: 210px; margin-left: auto; }
+.toolbar #searchInput { width: 170px; }
 .control, button {
   height: 30px;
   border: 1px solid var(--line-strong);
@@ -167,6 +169,8 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--blue); }
 .badge.plus_eligible, .badge.available { color: var(--green); background: var(--green-soft); }
 .badge.free, .badge.in_use { color: var(--amber); background: var(--amber-soft); }
 .badge.banned, .badge.failed, .badge.error, .badge.credential_invalid { color: var(--red); background: var(--red-soft); }
+.badge.registered { color: var(--green); background: var(--green-soft); }
+.badge.unregistered { color: #6f7a75; background: #eef1ef; }
 .token-btn { width: 100%; height: 25px; padding: 0 5px; color: #33413b; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; font-weight: 600; }
 .token-btn.present { color: var(--green); border-color: #bcdccc; background: #f3fbf7; }
 .token-btn.missing { color: #98a29d; border-style: dashed; }

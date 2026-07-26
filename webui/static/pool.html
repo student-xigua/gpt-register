@@ -29,24 +29,30 @@
       <span class="updated" id="updatedAt">尚未刷新</span>
     </div>
 
-    <section class="metrics" aria-label="号池概览">
+    <section class="metrics cols-6" aria-label="号池概览">
       <div class="metric"><span class="metric-icon"><i data-lucide="database"></i></span><div><b id="metricTotal">0</b><span>总计</span></div></div>
       <div class="metric"><span class="metric-icon"><i data-lucide="circle-check"></i></span><div><b id="metricAvailable">0</b><span>Available</span></div></div>
       <div class="metric"><span class="metric-icon"><i data-lucide="loader-circle"></i></span><div><b id="metricInUse">0</b><span>In use</span></div></div>
       <div class="metric"><span class="metric-icon"><i data-lucide="badge-check"></i></span><div><b id="metricDone">0</b><span>Done</span></div></div>
       <div class="metric"><span class="metric-icon"><i data-lucide="triangle-alert"></i></span><div><b id="metricFailed">0</b><span>Failed</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="user-check"></i></span><div><b id="metricRegistered">0</b><span>已注册</span></div></div>
     </section>
 
     <section class="toolbar" aria-label="号池工具栏">
+      <input id="searchInput" class="control" type="search" placeholder="搜索邮箱">
       <select id="statusFilter" class="control">
         <option value="">全部状态</option><option value="available">available</option>
         <option value="in_use">in_use</option><option value="done">done</option><option value="failed">failed</option>
+      </select>
+      <select id="registeredFilter" class="control">
+        <option value="">全部邮箱</option><option value="yes">已注册</option><option value="no">未注册</option>
       </select>
       <button id="refreshBtn"><i data-lucide="refresh-cw"></i>刷新</button>
       <button id="toggleImportBtn" class="primary"><i data-lucide="file-input"></i>导入四段邮箱</button>
       <button id="resetFailedBtn"><i data-lucide="rotate-ccw"></i>重试 failed</button>
       <button id="releaseBtn"><i data-lucide="recycle"></i>释放卡死号</button>
       <span class="selection-note">已选 <b id="selectedCount">0</b></span>
+      <button id="copySelectedBtn" disabled><i data-lucide="copy"></i>复制选中</button>
       <button id="resetSelectedBtn" disabled><i data-lucide="refresh-ccw"></i>重置选中</button>
       <button id="deleteSelectedBtn" class="danger" disabled><i data-lucide="trash-2"></i>删除选中</button>
       <span class="spacer"></span>
@@ -69,8 +75,8 @@
     <section class="table-card">
       <div class="table-scroll">
         <table id="poolTable">
-          <colgroup><col style="width:35px"><col style="width:30%"><col style="width:12%"><col><col style="width:190px"></colgroup>
-          <thead><tr><th class="check-cell"><input id="selectAll" type="checkbox" aria-label="全选当前页"></th><th>邮箱</th><th>状态</th><th>失败原因 / 重试信息</th><th>操作</th></tr></thead>
+          <colgroup><col style="width:35px"><col style="width:25%"><col style="width:10%"><col style="width:9%"><col><col style="width:250px"></colgroup>
+          <thead><tr><th class="check-cell"><input id="selectAll" type="checkbox" aria-label="全选当前页"></th><th>邮箱</th><th>状态</th><th>已注册</th><th>失败原因 / 重试信息</th><th>操作</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>

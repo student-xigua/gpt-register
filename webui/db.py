@@ -173,27 +173,48 @@ def import_accounts(text: str) -> dict:
     return {"parsed": len(rows), "inserted": inserted, "updated": updated, "skipped": skipped}
 
 
-def count_accounts(status: str = "") -> int:
-    con = _conn()
+def _accounts_filter(status: str = "", search: str = "", registered: str = "") -> tuple[str, list]:
+    """拼号池列表的 WHERE 子句：状态 + 邮箱模糊搜索 + 是否已注册（跟 registered 表 JOIN 后可用）。"""
+    clauses = []
+    params: list = []
     if status:
-        cur = con.execute("SELECT COUNT(*) FROM outlook_accounts WHERE status=?", (status,))
-    else:
-        cur = con.execute("SELECT COUNT(*) FROM outlook_accounts")
+        clauses.append("oa.status=?")
+        params.append(status)
+    if search:
+        clauses.append("oa.email LIKE ?")
+        params.append(f"%{search.strip().lower()}%")
+    if registered == "yes":
+        clauses.append("r.email IS NOT NULL")
+    elif registered == "no":
+        clauses.append("r.email IS NULL")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def count_accounts(status: str = "", search: str = "", registered: str = "") -> int:
+    con = _conn()
+    where, params = _accounts_filter(status, search, registered)
+    cur = con.execute(
+        f"SELECT COUNT(*) FROM outlook_accounts oa "
+        f"LEFT JOIN registered r ON r.email = oa.email {where}",
+        params,
+    )
     return cur.fetchone()[0]
 
 
-def list_accounts(status: str = "", limit: int = 50, offset: int = 0) -> list[dict]:
+def list_accounts(
+    status: str = "", limit: int = 50, offset: int = 0,
+    search: str = "", registered: str = "",
+) -> list[dict]:
+    """号池列表；附带 is_registered（该邮箱是否已在 registered 表出现过）供前端展示/筛选。"""
     con = _conn()
-    if status:
-        cur = con.execute(
-            "SELECT * FROM outlook_accounts WHERE status=? ORDER BY imported_at DESC LIMIT ? OFFSET ?",
-            (status, limit, offset),
-        )
-    else:
-        cur = con.execute(
-            "SELECT * FROM outlook_accounts ORDER BY imported_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
+    where, params = _accounts_filter(status, search, registered)
+    cur = con.execute(
+        f"SELECT oa.*, CASE WHEN r.email IS NOT NULL THEN 1 ELSE 0 END AS is_registered "
+        f"FROM outlook_accounts oa LEFT JOIN registered r ON r.email = oa.email "
+        f"{where} ORDER BY oa.imported_at DESC LIMIT ? OFFSET ?",
+        (*params, limit, offset),
+    )
     return [dict(r) for r in cur.fetchall()]
 
 
@@ -409,6 +430,10 @@ def stats() -> dict:
     for r in cur.fetchall():
         out[r["status"]] = r["n"]
         out["total"] += r["n"]
+    out["registered"] = con.execute(
+        "SELECT COUNT(*) FROM outlook_accounts oa "
+        "JOIN registered r ON r.email = oa.email"
+    ).fetchone()[0]
     return out
 
 

@@ -79,9 +79,15 @@ def api_import(req: ImportReq):
 
 
 @app.get("/api/accounts")
-def api_accounts(status: str = "", limit: int = 50, offset: int = 0):
-    items = db.list_accounts(status=status, limit=limit, offset=offset)
-    total = db.count_accounts(status=status)
+def api_accounts(
+    status: str = "", limit: int = 50, offset: int = 0,
+    search: str = "", registered: str = "",
+):
+    items = db.list_accounts(
+        status=status, limit=limit, offset=offset,
+        search=search, registered=registered,
+    )
+    total = db.count_accounts(status=status, search=search, registered=registered)
     return {"ok": True, "items": items, "total": total}
 
 
@@ -91,6 +97,34 @@ def api_delete_account(email: str):
     if not ok:
         raise HTTPException(404, "not found")
     return {"ok": True}
+
+
+@app.post("/api/accounts/{email}/fetch_code")
+def api_fetch_code(email: str):
+    """人工接码：从号池原始 Outlook 邮箱现取一次最近的验证码（不占用号池状态）。"""
+    row = db.get_account(email)
+    if not row:
+        raise HTTPException(404, f"号池中没有 {email}")
+    if not row.get("refresh_token") and not row.get("password"):
+        raise HTTPException(400, "该邮箱缺少可用凭据（refresh_token / 密码均为空）")
+
+    import sys as _sys
+    ROOT_DIR = Path(__file__).resolve().parents[1]
+    if str(ROOT_DIR) not in _sys.path:
+        _sys.path.insert(0, str(ROOT_DIR))
+    from mail_outlook import OutlookMailProvider
+
+    provider = OutlookMailProvider(
+        row["email"], row.get("password") or "", row.get("client_id") or "",
+        row.get("refresh_token") or "",
+    )
+    try:
+        code = provider.wait_for_otp(
+            row["email"], timeout=90, issued_after=time.time() - 1800,
+        )
+        return {"ok": True, "email": row["email"], "code": code}
+    except Exception as e:
+        raise HTTPException(504, f"未取到验证码: {e}")
 
 
 class BulkDeleteReq(BaseModel):
