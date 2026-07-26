@@ -171,6 +171,8 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--blue); }
 .badge.banned, .badge.failed, .badge.error, .badge.credential_invalid { color: var(--red); background: var(--red-soft); }
 .badge.registered { color: var(--green); background: var(--green-soft); }
 .badge.unregistered { color: #6f7a75; background: #eef1ef; }
+.badge.used { color: var(--blue); background: var(--blue-soft); }
+.badge.unused { color: #6f7a75; background: #eef1ef; }
 .token-btn { width: 100%; height: 25px; padding: 0 5px; color: #33413b; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; font-weight: 600; }
 .token-btn.present { color: var(--green); border-color: #bcdccc; background: #f3fbf7; }
 .token-btn.missing { color: #98a29d; border-style: dashed; }

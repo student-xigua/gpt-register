@@ -437,6 +437,17 @@ def api_two_factor_lines(req: TwoFactorCopyReq):
     )
 
 
+class MarkUsedReq(BaseModel):
+    emails: list[str] = Field(..., min_length=1, max_length=500, description="账号邮箱列表")
+
+
+@app.post("/api/account-management/mark_used")
+def api_mark_used(req: MarkUsedReq):
+    """把账号标记为「已使用」：复制过 AT 或导出过 Sub2API 文件时前端调用。"""
+    n = db.mark_registered_used(req.emails)
+    return {"ok": True, "marked": n}
+
+
 @app.post("/api/account-management/tasks/refresh-status")
 def api_start_status_refresh(req: AccountEmailsReq):
     if not req.emails:

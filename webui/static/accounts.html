@@ -32,12 +32,13 @@
       <span class="updated" id="updatedAt">尚未刷新</span>
     </div>
 
-    <section class="metrics" aria-label="账号概览">
+    <section class="metrics cols-6" aria-label="账号概览">
       <div class="metric"><span class="metric-icon"><i data-lucide="database"></i></span><div><b id="metricTotal">0</b><span>账号总数</span></div></div>
       <div class="metric"><span class="metric-icon"><i data-lucide="key-round"></i></span><div><b id="metricRt">0</b><span>已有 OpenAI RT</span></div></div>
       <div class="metric"><span class="metric-icon"><i data-lucide="sparkles"></i></span><div><b id="metricPlus">0</b><span>Plus / 优惠 / 试用</span></div></div>
       <div class="metric"><span class="metric-icon"><i data-lucide="circle-dollar-sign"></i></span><div><b id="metricFree">0</b><span>Free 缓存</span></div></div>
       <div class="metric"><span class="metric-icon"><i data-lucide="shield-alert"></i></span><div><b id="metricIssues">0</b><span>凭证异常 / 停用</span></div></div>
+      <div class="metric"><span class="metric-icon"><i data-lucide="check-check"></i></span><div><b id="metricUsed">0</b><span>已使用</span></div></div>
     </section>
 
     <section class="toolbar" aria-label="账号工具栏">
@@ -46,6 +47,8 @@
         <button data-filter="plus" title="Plus / 优惠 / 试用">Plus</button>
         <button data-filter="has_rt">有 RT</button>
         <button data-filter="no_rt">无 RT</button>
+        <button data-filter="used" title="导出过文件 / 复制过 AT">已使用</button>
+        <button data-filter="unused">未使用</button>
       </div>
       <button id="refreshBtn" title="刷新列表"><i data-lucide="refresh-cw"></i>刷新</button>
       <span class="selection-note">已选 <b id="selectedCount">0</b></span>
@@ -64,15 +67,16 @@
       <div class="table-scroll" id="tableScroll">
         <table id="accountsTable">
           <colgroup>
-            <col style="width:35px"><col style="width:19%"><col style="width:11%">
-            <col style="width:7%"><col style="width:7%"><col style="width:7%">
-            <col style="width:11%"><col>
+            <col style="width:35px"><col style="width:17%"><col style="width:9%">
+            <col style="width:8%"><col style="width:6%"><col style="width:6%"><col style="width:6%">
+            <col style="width:10%"><col>
           </colgroup>
           <thead>
             <tr>
               <th class="check-cell"><input id="selectAll" type="checkbox" aria-label="全选当前页"></th>
               <th>账号邮箱</th>
               <th>套餐状态</th>
+              <th>使用状态</th>
               <th>AT</th>
               <th>ST</th>
               <th>RT</th>

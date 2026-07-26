@@ -42,6 +42,12 @@ function plusBadge(info) {
   return `<span class="badge ${escapeHtml(status)}" title="${escapeHtml(label)}">${escapeHtml(label)}</span>`;
 }
 
+function usedBadge(row) {
+  return row.used_at
+    ? `<span class="badge used" title="${escapeHtml(fmtTime(row.used_at))}">已使用</span>`
+    : `<span class="badge unused">未使用</span>`;
+}
+
 function tokenButton(row, field, length) {
   const short = { access_token: "AT", session_token: "ST", refresh_token: "RT" }[field];
   if (!length) return `<button class="token-btn missing" data-action="acquire" data-email="${escapeHtml(row.email)}" data-field="${field}">${field === "refresh_token" ? "获取" : "—"} ${short}</button>`;
@@ -51,7 +57,7 @@ function tokenButton(row, field, length) {
 function renderRows() {
   const body = $("#accountsTable tbody");
   if (!state.rows.length) {
-    body.innerHTML = `<tr><td class="empty" colspan="8"><i data-lucide="database-zap"></i> 当前筛选下暂无账号</td></tr>`;
+    body.innerHTML = `<tr><td class="empty" colspan="9"><i data-lucide="database-zap"></i> 当前筛选下暂无账号</td></tr>`;
     initIcons();
     return;
   }
@@ -64,6 +70,7 @@ function renderRows() {
       <td class="check-cell"><input class="row-check" type="checkbox" data-email="${escapeHtml(row.email)}" ${state.selected.has(row.email) ? "checked" : ""}></td>
       <td><span class="truncate email" title="${escapeHtml(row.email)}">${escapeHtml(row.email)}</span><span class="subline">录入 ${fmtTime(row.created_at)}</span></td>
       <td>${plusBadge(row.plus_check)}</td>
+      <td>${usedBadge(row)}</td>
       <td>${tokenButton(row, "access_token", row.at_len)}</td>
       <td>${tokenButton(row, "session_token", row.st_len)}</td>
       <td>${tokenButton(row, "refresh_token", row.rt_len)}</td>
@@ -102,6 +109,7 @@ async function refresh(reset = false) {
     $("#metricPlus").textContent = result.summary?.plus ?? "—";
     $("#metricFree").textContent = result.summary?.free ?? "—";
     $("#metricIssues").textContent = result.summary?.issues ?? "—";
+    $("#metricUsed").textContent = result.summary?.used ?? "—";
     $("#totalNote").textContent = result.summary?.total ?? result.total;
     $("#updatedAt").textContent = `列表刷新 ${new Date().toLocaleTimeString("zh-CN", {hour:"2-digit", minute:"2-digit"})}`;
     $("#serverState").textContent = "服务正常";
@@ -117,17 +125,31 @@ async function getCredential(email) {
   return data;
 }
 
+async function markUsed(emails) {
+  if (!emails || !emails.length) return;
+  try {
+    await api("api/account-management/mark_used", {
+      method: "POST", body: JSON.stringify({ emails }),
+    });
+    await refresh(false);
+  } catch (_) {
+    // 静默失败：使用状态只是辅助标记，不应该打断主操作的成功提示
+  }
+}
+
 async function copyTokens(emails) {
   const values = [];
+  const usedEmails = [];
   let skipped = 0;
   for (const email of emails) {
     const data = await getCredential(email);
-    if (data.access_token) values.push(data.access_token);
+    if (data.access_token) { values.push(data.access_token); usedEmails.push(email); }
     else skipped += 1;
   }
   if (!values.length) throw new Error("所选账号都没有 AT");
   await copyText(values.join("\n"));
   setToast(`已复制 ${values.length} 个 AT${skipped ? `，跳过 ${skipped} 个` : ""}`, "ok");
+  markUsed(usedEmails);
 }
 
 async function copySourceEmails(emails) {
@@ -192,7 +214,7 @@ async function startTask(path, emails, label) {
     updateSelection();
     if (result.reused) setToast("该账号已有同类任务在跑，已继续查看原任务", "ok");
   }
-  watchTask(result.task_id, label, busySet ? { set: busySet, emails } : null);
+  watchTask(result.task_id, label, busySet ? { set: busySet, emails } : null, emails);
 }
 
 function renderTaskEvents(events = []) {
@@ -209,7 +231,7 @@ function renderTaskEvents(events = []) {
   `).join("");
 }
 
-function watchTask(taskId, label, busy = null) {
+function watchTask(taskId, label, busy = null, requestedEmails = []) {
   clearTimeout(state.taskTimer);
   $("#taskDrawer").classList.remove("hidden");
   $("#taskTitle").textContent = label;
@@ -248,6 +270,9 @@ function watchTask(taskId, label, busy = null) {
         busy?.emails.forEach(email => busy.set.delete(email));
         const tone = task.succeeded ? "ok" : "bad";
         setToast(task.message, tone);
+        if (["sub2_export", "acquire_rt"].includes(task.kind) && task.download_ready) {
+          markUsed(requestedEmails);
+        }
         await refresh(false);
         if (task.kind === "acquire_rt" && task.download_ready) {
           window.location.assign(appUrl(`api/account-tasks/${taskId}/download`));
@@ -305,6 +330,7 @@ $("#accountsTable").addEventListener("click", async event => {
       const data = await getCredential(email);
       await copyText(data[field] || "");
       setToast(`${field.toUpperCase()} 已复制`, "ok");
+      if (field === "access_token" && data[field]) markUsed([email]);
     } else if (action === "view") {
       showCredential(email, await getCredential(email));
     } else if (action === "email") {

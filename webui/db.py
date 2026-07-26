@@ -113,6 +113,10 @@ def init_db():
                     (status, row["email"]),
                 )
         con.commit()
+    # 老 DB migrate：used_at 标记账号是否已被人工使用（复制过 AT / 导出过 Sub2API 文件）
+    if "used_at" not in registered_cols:
+        con.execute("ALTER TABLE registered ADD COLUMN used_at REAL")
+        con.commit()
 
 
 # ──────────────────────── outlook 号池 ────────────────────────
@@ -521,6 +525,8 @@ _FILTER_WHERE = {
     "has_rt": ("WHERE length(refresh_token) > 0", ()),
     "no_rt": ("WHERE coalesce(length(refresh_token),0) = 0", ()),
     "plus": (f"WHERE plan_status IN ({_PLUS_IN})", PLUS_STATUSES),
+    "used": ("WHERE used_at IS NOT NULL", ()),
+    "unused": ("WHERE used_at IS NULL", ()),
 }
 
 
@@ -539,9 +545,12 @@ def registered_summary() -> dict:
     """返回账号管理顶部概览；Plus/Free 来自最近一次状态缓存。"""
     con = _conn()
     rows = con.execute(
-        "SELECT refresh_token, plan_status FROM registered"
+        "SELECT refresh_token, plan_status, used_at FROM registered"
     ).fetchall()
-    summary = {"total": len(rows), "has_rt": 0, "plus": 0, "free": 0, "issues": 0}
+    summary = {
+        "total": len(rows), "has_rt": 0, "plus": 0, "free": 0, "issues": 0,
+        "used": 0, "unused": 0,
+    }
     for row in rows:
         if str(row["refresh_token"] or "").strip():
             summary["has_rt"] += 1
@@ -552,6 +561,10 @@ def registered_summary() -> dict:
             summary["free"] += 1
         elif status in ("banned", "credential_invalid", "error"):
             summary["issues"] += 1
+        if row["used_at"]:
+            summary["used"] += 1
+        else:
+            summary["unused"] += 1
     return summary
 
 
@@ -562,7 +575,7 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
         f"SELECT email, password, "
         f"length(access_token) AS at_len, length(session_token) AS st_len, "
         f"length(refresh_token) AS rt_len, length(totp_secret) AS totp_len, "
-        f"extra_json, created_at FROM registered "
+        f"used_at, extra_json, created_at FROM registered "
         f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
         (*params, limit, offset),
     )
@@ -580,6 +593,30 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
         d.pop("extra_json", None)
         rows.append(d)
     return rows
+
+
+def mark_registered_used(emails: list[str]) -> int:
+    """把 Plus 账号标记为「已使用」（复制过 AT / 导出过 Sub2API 文件）。
+
+    只有当前 plan_status 已经是 Plus/优惠/试用 时才计入「已使用」——
+    检测出 Plus 之前的导出/复制不算「使用」，Free 账号也不算。
+    只在首次标记时写入时间戳。
+    """
+    cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
+    if not cleaned:
+        return 0
+    with _lock:
+        con = _conn()
+        email_in = ",".join("?" * len(cleaned))
+        plus_in = ", ".join("?" * len(PLUS_STATUSES))
+        rc = con.execute(
+            f"UPDATE registered SET used_at=? "
+            f"WHERE email IN ({email_in}) AND used_at IS NULL "
+            f"AND plan_status IN ({plus_in})",
+            (time.time(), *cleaned, *PLUS_STATUSES),
+        )
+        con.commit()
+        return rc.rowcount
 
 
 def list_registered_full(limit: int = 5000) -> list[dict]:
