@@ -369,6 +369,40 @@ def api_start_acquire_rt(req: AccountEmailsReq):
     return {"ok": True, "task_id": task_id, "reused": reused}
 
 
+@app.post("/api/account-management/tasks/bind-2fa")
+def api_start_bind_2fa(req: AccountEmailsReq):
+    if not req.emails:
+        raise HTTPException(400, "emails 不能为空")
+    try:
+        task_id, reused = account_ops.start_totp_bind(
+            req.emails,
+            proxy=req.proxy,
+            otp_timeout=req.otp_timeout,
+        )
+    except account_ops.AccountTaskBusy as exc:
+        raise HTTPException(
+            409,
+            f"部分所选账号正在另一个 2FA 任务中，请等待任务 {exc.task_id[:8]} 完成。",
+        ) from exc
+    return {"ok": True, "task_id": task_id, "reused": reused}
+
+
+class TwoFactorCopyReq(BaseModel):
+    emails: list[str] = Field(..., min_length=1, max_length=500, description="账号邮箱列表")
+
+
+@app.post("/api/account-management/2fa/lines")
+def api_two_factor_lines(req: TwoFactorCopyReq):
+    """返回「账号----密码----2FA 密钥」交付行；未绑定的账号在 missing 里列出。"""
+    lines, missing = account_ops.two_factor_lines(req.emails)
+    if not lines:
+        raise HTTPException(400, "所选账号都还没有 2FA 密钥")
+    return JSONResponse(
+        {"ok": True, "lines": lines, "missing": missing},
+        headers={"Cache-Control": "no-store, private"},
+    )
+
+
 @app.post("/api/account-management/tasks/refresh-status")
 def api_start_status_refresh(req: AccountEmailsReq):
     if not req.emails:

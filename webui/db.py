@@ -59,6 +59,8 @@ def init_db():
             device_id       TEXT,
             csrf_token      TEXT,
             cookie_header   TEXT,
+            totp_secret     TEXT,
+            plan_status     TEXT,
             extra_json      TEXT,
             created_at      REAL
         );
@@ -85,6 +87,31 @@ def init_db():
     account_cols = {r[1] for r in cur.fetchall()}
     if "retry_after" not in account_cols:
         con.execute("ALTER TABLE outlook_accounts ADD COLUMN retry_after REAL")
+        con.commit()
+    # 老 DB migrate：totp_secret 随 2FA 绑定功能加入
+    cur = con.execute("PRAGMA table_info(registered)")
+    registered_cols = {r[1] for r in cur.fetchall()}
+    if "totp_secret" not in registered_cols:
+        con.execute("ALTER TABLE registered ADD COLUMN totp_secret TEXT")
+        con.commit()
+    # 老 DB migrate：plan_status 从 extra_json.plus_check 提出来，供套餐筛选直接查
+    if "plan_status" not in registered_cols:
+        con.execute("ALTER TABLE registered ADD COLUMN plan_status TEXT")
+        con.commit()
+        rows = con.execute(
+            "SELECT email, extra_json FROM registered WHERE extra_json IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            try:
+                extra = json.loads(row["extra_json"] or "{}")
+                status = str((extra.get("plus_check") or {}).get("status") or "")
+            except Exception:
+                status = ""
+            if status:
+                con.execute(
+                    "UPDATE registered SET plan_status=? WHERE email=?",
+                    (status, row["email"]),
+                )
         con.commit()
 
 
@@ -399,15 +426,24 @@ def save_registered(d: dict) -> None:
         return
     extra = {k: v for k, v in d.items() if k not in {
         "email", "password", "access_token", "session_token", "refresh_token",
-        "id_token", "device_id", "csrf_token", "cookie_header",
+        "id_token", "device_id", "csrf_token", "cookie_header", "totp_secret",
     }}
+    totp_secret = str(d.get("totp_secret") or "")
     with _lock:
         con = _conn()
+        # 2FA 密钥丢了就无法找回（OpenAI 只在 enroll 时返回一次），
+        # 因此重复注册/回写时若没带新密钥，保留已存的旧密钥。
+        if not totp_secret:
+            row = con.execute(
+                "SELECT totp_secret FROM registered WHERE email=?", (email,)
+            ).fetchone()
+            totp_secret = str((row["totp_secret"] if row else "") or "")
         con.execute(
             "INSERT OR REPLACE INTO registered "
             "(email, password, access_token, session_token, refresh_token, "
-            "id_token, device_id, csrf_token, cookie_header, extra_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "id_token, device_id, csrf_token, cookie_header, totp_secret, "
+            "extra_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 email,
                 d.get("password", ""),
@@ -418,6 +454,7 @@ def save_registered(d: dict) -> None:
                 d.get("device_id", ""),
                 d.get("csrf_token", ""),
                 d.get("cookie_header", ""),
+                totp_secret,
                 json.dumps(extra, ensure_ascii=False) if extra else None,
                 time.time(),
             ),
@@ -426,7 +463,7 @@ def save_registered(d: dict) -> None:
 
 
 def update_plus_check(email: str, plus_info: dict) -> None:
-    """把 Plus 检查结果写入 extra_json.plus_check。"""
+    """把 Plus 检查结果写入 extra_json.plus_check，并同步可直接查询的 plan_status 列。"""
     email = email.lower()
     con = _conn()
     cur = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,))
@@ -442,20 +479,34 @@ def update_plus_check(email: str, plus_info: dict) -> None:
     extra["plus_check"] = plus_info
     with _lock:
         con.execute(
-            "UPDATE registered SET extra_json=? WHERE email=?",
-            (json.dumps(extra, ensure_ascii=False), email),
+            "UPDATE registered SET extra_json=?, plan_status=? WHERE email=?",
+            (
+                json.dumps(extra, ensure_ascii=False),
+                str((plus_info or {}).get("status") or ""),
+                email,
+            ),
         )
         con.commit()
 
 
+# 顶部「Plus / 优惠 / 试用」概览与 Plus 筛选共用同一组状态，两处口径必须一致
+PLUS_STATUSES = ("plus_active", "plus_promo", "plus_eligible")
+_PLUS_IN = ", ".join("?" * len(PLUS_STATUSES))
+_FILTER_WHERE = {
+    "has_rt": ("WHERE length(refresh_token) > 0", ()),
+    "no_rt": ("WHERE coalesce(length(refresh_token),0) = 0", ()),
+    "plus": (f"WHERE plan_status IN ({_PLUS_IN})", PLUS_STATUSES),
+}
+
+
+def _registered_filter(filter_rt: str) -> tuple[str, tuple]:
+    return _FILTER_WHERE.get(filter_rt, ("", ()))
+
+
 def count_registered(filter_rt: str = "all") -> int:
     con = _conn()
-    if filter_rt == "has_rt":
-        cur = con.execute("SELECT COUNT(*) FROM registered WHERE length(refresh_token) > 0")
-    elif filter_rt == "no_rt":
-        cur = con.execute("SELECT COUNT(*) FROM registered WHERE coalesce(length(refresh_token),0) = 0")
-    else:
-        cur = con.execute("SELECT COUNT(*) FROM registered")
+    where, params = _registered_filter(filter_rt)
+    cur = con.execute(f"SELECT COUNT(*) FROM registered {where}", params)
     return cur.fetchone()[0]
 
 
@@ -463,18 +514,14 @@ def registered_summary() -> dict:
     """返回账号管理顶部概览；Plus/Free 来自最近一次状态缓存。"""
     con = _conn()
     rows = con.execute(
-        "SELECT refresh_token, extra_json FROM registered"
+        "SELECT refresh_token, plan_status FROM registered"
     ).fetchall()
     summary = {"total": len(rows), "has_rt": 0, "plus": 0, "free": 0, "issues": 0}
     for row in rows:
         if str(row["refresh_token"] or "").strip():
             summary["has_rt"] += 1
-        try:
-            extra = json.loads(row["extra_json"] or "{}")
-            status = (extra.get("plus_check") or {}).get("status")
-        except Exception:
-            status = None
-        if status in ("plus_active", "plus_promo", "plus_eligible"):
+        status = row["plan_status"] or None
+        if status in PLUS_STATUSES:
             summary["plus"] += 1
         elif status == "free":
             summary["free"] += 1
@@ -485,18 +532,14 @@ def registered_summary() -> dict:
 
 def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") -> list[dict]:
     con = _conn()
-    if filter_rt == "has_rt":
-        where = "WHERE length(refresh_token) > 0"
-    elif filter_rt == "no_rt":
-        where = "WHERE coalesce(length(refresh_token),0) = 0"
-    else:
-        where = ""
+    where, params = _registered_filter(filter_rt)
     cur = con.execute(
         f"SELECT email, password, "
         f"length(access_token) AS at_len, length(session_token) AS st_len, "
-        f"length(refresh_token) AS rt_len, extra_json, created_at FROM registered "
+        f"length(refresh_token) AS rt_len, length(totp_secret) AS totp_len, "
+        f"extra_json, created_at FROM registered "
         f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        (limit, offset),
+        (*params, limit, offset),
     )
     rows = []
     for r in cur.fetchall():
@@ -554,7 +597,7 @@ def update_registered_fields(email: str, **fields) -> bool:
     """只更新已注册账号的指定凭证字段，空值不会意外抹掉已有数据。"""
     allowed = {
         "access_token", "session_token", "refresh_token", "id_token",
-        "device_id", "csrf_token", "cookie_header",
+        "device_id", "csrf_token", "cookie_header", "totp_secret",
     }
     updates = {
         key: value

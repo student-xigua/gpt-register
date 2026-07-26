@@ -19,7 +19,7 @@ from config import Config
 from log_safety import redact_sensitive_text
 from mail_outlook import OutlookMailProvider
 
-from . import db, exporter
+from . import db, exporter, twofa
 from .sms_runtime import build_sms_controller
 
 logger = logging.getLogger("webui.account_ops")
@@ -32,6 +32,9 @@ PHASE_LABELS = {
     "web_session": "建立网页会话",
     "codex_oauth": "Codex 授权",
     "phone_verification": "手机验证",
+    "reauth": "2FA 重认证",
+    "enroll": "注册 TOTP",
+    "activate": "激活 2FA",
     "persist": "保存 RT",
     "download": "生成下载文件",
     "complete": "任务完成",
@@ -141,6 +144,12 @@ class AccountTask:
 
 _tasks: dict[str, AccountTask] = {}
 _active_rt_by_email: dict[str, str] = {}
+_active_2fa_by_email: dict[str, str] = {}
+# 同一账号同类任务只允许一个在跑（重复登录/重复 enroll 会互相打断登录态）
+_EXCLUSIVE_TASKS: dict[str, dict[str, str]] = {
+    "acquire_rt": _active_rt_by_email,
+    "bind_2fa": _active_2fa_by_email,
+}
 _lock = threading.Lock()
 
 
@@ -195,6 +204,37 @@ def _new_task(kind: str, total: int, *, emails: tuple[str, ...] = ()) -> Account
     return task
 
 
+def _claim_exclusive_task(kind: str, requested: list[str]) -> tuple[Optional[AccountTask], str]:
+    """为一批账号占用某类独占任务。
+
+    返回 (新建任务, 可复用的旧任务 id)；同一批账号命中同一个在跑的任务时复用它，
+    命中多个不同任务则抛 AccountTaskBusy 让调用方提示等待。
+    """
+    registry = _EXCLUSIVE_TASKS[kind]
+    with _lock:
+        _prune_tasks_locked()
+        active_ids = {
+            registry[email] for email in requested if email in registry
+        }
+        if active_ids:
+            task_id = next(iter(active_ids))
+            if len(active_ids) == 1 and all(
+                registry.get(email) == task_id for email in requested
+            ):
+                return None, task_id
+            raise AccountTaskBusy(task_id)
+        task = AccountTask(
+            task_id=uuid.uuid4().hex,
+            kind=kind,
+            total=len(requested),
+            emails=tuple(requested),
+        )
+        _tasks[task.task_id] = task
+        for email in requested:
+            registry[email] = task.task_id
+        return task, ""
+
+
 def get_task(task_id: str) -> Optional[dict]:
     with _lock:
         task = _tasks.get(task_id)
@@ -239,11 +279,12 @@ def _run_async(task: AccountTask, worker: Callable[[AccountTask], None]) -> str:
         finally:
             task.current_email = ""
             task.finished_at = time.time()
-            if task.kind == "acquire_rt":
+            registry = _EXCLUSIVE_TASKS.get(task.kind)
+            if registry is not None:
                 with _lock:
                     for email in task.emails:
-                        if _active_rt_by_email.get(email) == task.task_id:
-                            _active_rt_by_email.pop(email, None)
+                        if registry.get(email) == task.task_id:
+                            registry.pop(email, None)
 
     threading.Thread(
         target=run,
@@ -485,29 +526,9 @@ def start_rt_login(
     requested = list(dict.fromkeys(_clean_email(e) for e in emails if _clean_email(e)))
     if not requested:
         raise ValueError("emails 不能为空")
-    with _lock:
-        _prune_tasks_locked()
-        active_ids = {
-            _active_rt_by_email[email]
-            for email in requested
-            if email in _active_rt_by_email
-        }
-        if active_ids:
-            task_id = next(iter(active_ids))
-            if len(active_ids) == 1 and all(
-                _active_rt_by_email.get(email) == task_id for email in requested
-            ):
-                return task_id, True
-            raise AccountTaskBusy(task_id)
-        task = AccountTask(
-            task_id=uuid.uuid4().hex,
-            kind="acquire_rt",
-            total=len(requested),
-            emails=tuple(requested),
-        )
-        _tasks[task.task_id] = task
-        for email in requested:
-            _active_rt_by_email[email] = task.task_id
+    task, reused_id = _claim_exclusive_task("acquire_rt", requested)
+    if task is None:
+        return reused_id, True
 
     def worker(state: AccountTask) -> None:
         successful: list[dict] = []
@@ -609,6 +630,229 @@ def start_rt_login(
         )
 
     return _run_async(task, worker), False
+
+
+def _reauth_web_session_for_2fa(
+    flow,
+    email: str,
+    *,
+    otp_timeout: int,
+    emit: Callable[..., None],
+) -> dict:
+    """走邮箱验证码重认证，换一份 pwd_auth_time 新鲜的网页登录态。"""
+    source = db.get_account(email)
+    if not source or not source.get("client_id") or not source.get("refresh_token"):
+        raise AccountOperationError(
+            "SOURCE_EMAIL_NOT_FOUND",
+            "绑定 2FA 需要邮箱重认证，但号池里没有该账号可用的原始邮箱凭据。",
+            "请先把该账号的 Outlook 四段邮箱重新导入号池后重试。",
+        )
+    mail = OutlookMailProvider(
+        email=source["email"],
+        password=source.get("password", ""),
+        client_id=source["client_id"],
+        refresh_token=source["refresh_token"],
+    )
+    issued_after = time.time()
+    auth_url = twofa.trigger_reauth(flow, email)
+    time.sleep(1)
+    twofa.follow_reauth(flow, auth_url)
+    emit("email_otp", "重认证验证码已发出，正在从 Outlook 邮箱读取", status="running")
+    code = mail.wait_for_otp(
+        email,
+        timeout=max(30, min(int(otp_timeout), 600)),
+        issued_after=issued_after,
+    )
+    emit("email_otp", "邮箱验证码读取成功", status="success")
+    continue_url = twofa.validate_reauth_otp(flow, code)
+    session = twofa.exchange_web_session(flow, continue_url)
+    emit("reauth", "重认证完成，已换到新的网页登录态", status="success")
+    return session
+
+
+def _bind_two_factor(
+    email: str,
+    *,
+    proxy: str = "",
+    otp_timeout: int = 180,
+    progress: Optional[Callable[..., None]] = None,
+) -> str:
+    """给已注册账号绑定 TOTP，返回并落库 2FA 密钥。"""
+    emit = progress or (lambda *_args, **_kwargs: None)
+    cred = db.get_registered(email)
+    if not cred:
+        raise AccountOperationError(
+            "ACCOUNT_NOT_FOUND",
+            "账号不在已注册列表里。",
+            "请先完成注册或导入该账号的凭证后重试。",
+        )
+    existing = twofa.normalize_secret(cred.get("totp_secret"))
+    if existing:
+        emit("complete", "该账号已有 2FA 密钥，无需重复绑定", status="success")
+        return existing
+
+    session_token = str(cred.get("session_token") or "").strip()
+    access_token = str(cred.get("access_token") or "").strip()
+    if not session_token and not access_token:
+        raise AccountOperationError(
+            "CREDENTIAL_MISSING",
+            "该账号没有可用的网页登录态（ST / AT 均为空）。",
+            "请先用“取 RT”重新登录该账号，拿到网页登录态后再绑定 2FA。",
+        )
+
+    emit("prepare", "正在用已有网页登录态检查账号", status="running")
+    flow = AuthFlow(Config(proxy=proxy.strip() or None))
+    try:
+        flow.from_existing_credentials(
+            session_token, access_token, str(cred.get("device_id") or "")
+        )
+        session = twofa.fetch_web_session(flow)
+        if not session["access_token"]:
+            raise AccountOperationError(
+                "WEB_SESSION_INVALID",
+                "网页登录态已失效，无法绑定 2FA。",
+                "请先用“取 RT”重新登录该账号刷新登录态后重试。",
+            )
+        if session["mfa"]:
+            raise AccountOperationError(
+                "TWO_FA_ALREADY_BOUND",
+                "该账号在 OpenAI 侧已经开启二步验证，但本地没有对应密钥。",
+                "请在 ChatGPT 网页端关闭二步验证后重试，或手动补录密钥。",
+            )
+        access_token = session["access_token"]
+        emit("prepare", "网页登录态可用，开始绑定 2FA", status="success")
+
+        try:
+            secret, session_id = twofa.enroll_totp(flow, access_token)
+            emit("enroll", "已直接取到 TOTP 密钥，无需重认证", status="success")
+        except twofa.TwoFactorProtocolError as exc:
+            # enroll 要求 AT 里的 pwd_auth_time 足够新鲜，过期就得先走邮箱重认证。
+            emit(
+                "reauth",
+                f"登录态需要重新认证（{redact_sensitive_text(exc, max_length=80)}），正在发送邮箱验证码",
+                status="running",
+            )
+            session = _reauth_web_session_for_2fa(
+                flow, email, otp_timeout=otp_timeout, emit=emit
+            )
+            access_token = session["access_token"]
+            secret, session_id = twofa.enroll_totp(flow, access_token)
+            emit("enroll", "重认证后已取到 TOTP 密钥", status="success")
+
+        twofa.activate_totp(flow, access_token, secret, session_id)
+        emit("activate", "2FA 已激活", status="success")
+
+        db.update_registered_fields(
+            email,
+            totp_secret=twofa.normalize_secret(secret),
+            access_token=access_token,
+            session_token=session.get("session_token") or None,
+            cookie_header=flow._build_chatgpt_cookie_header() or None,
+        )
+        emit("persist", "2FA 密钥已写入账号缓存", status="success")
+        return twofa.normalize_secret(secret)
+    except twofa.TwoFactorProtocolError as exc:
+        message = f"2FA 绑定失败：{redact_sensitive_text(exc, max_length=140)}"
+        emit("failed", message, status="error", code="TWO_FA_BIND_FAILED")
+        raise AccountOperationError(
+            "TWO_FA_BIND_FAILED",
+            message,
+            "请稍后重试；若持续失败，请先刷新账号状态确认登录态仍然有效。",
+        ) from exc
+    finally:
+        try:
+            flow.session.close()
+        except Exception:
+            pass
+
+
+def start_totp_bind(
+    emails: list[str],
+    *,
+    proxy: str = "",
+    otp_timeout: int = 180,
+) -> tuple[str, bool]:
+    requested = list(dict.fromkeys(_clean_email(e) for e in emails if _clean_email(e)))
+    if not requested:
+        raise ValueError("emails 不能为空")
+    task, reused_id = _claim_exclusive_task("bind_2fa", requested)
+    if task is None:
+        return reused_id, True
+
+    def worker(state: AccountTask) -> None:
+        for email in requested:
+            state.current_email = email
+            state.message = f"正在绑定 {state.completed + 1}/{state.total}"
+
+            def progress(phase, detail, *, status="running", code=""):
+                state.set_phase(phase, detail, status=status, email=email, code=code)
+
+            try:
+                _bind_two_factor(
+                    email,
+                    proxy=proxy,
+                    otp_timeout=otp_timeout,
+                    progress=progress,
+                )
+                state.succeeded += 1
+                state.results[email] = {
+                    "status": "ok",
+                    "code": "TWO_FA_BOUND",
+                    "label": "2FA 绑定成功",
+                }
+            except Exception as exc:
+                state.failed += 1
+                error = _error_payload(exc)
+                state.errors.append({
+                    "email": email,
+                    "error": error["message"],
+                    "code": error["code"],
+                    "action": error["action"],
+                })
+                state.results[email] = {
+                    "status": "error",
+                    "code": error["code"],
+                    "label": error["message"],
+                    "action": error["action"],
+                }
+                if error["action"] and not state.action_required:
+                    state.action_required = error["action"]
+                state.set_phase(
+                    "failed",
+                    error["message"],
+                    status="error",
+                    email=email,
+                    code=error["code"],
+                )
+            finally:
+                state.completed += 1
+        state.message = f"2FA 绑定成功 {state.succeeded} 个，失败 {state.failed} 个"
+        state.set_phase(
+            "complete" if state.failed == 0 else "failed",
+            state.message,
+            status="success" if state.failed == 0 else "error",
+            code="" if state.failed == 0 else "TWO_FA_TASK_PARTIAL_OR_FAILED",
+        )
+
+    return _run_async(task, worker), False
+
+
+def two_factor_lines(emails: list[str]) -> tuple[list[str], list[str]]:
+    """组装「账号----密码----2FA 密钥」交付行；未绑定 2FA 的账号单独返回。"""
+    requested = list(dict.fromkeys(_clean_email(e) for e in emails if _clean_email(e)))
+    lines: list[str] = []
+    missing: list[str] = []
+    for email in requested:
+        cred = db.get_registered(email) or {}
+        secret = twofa.normalize_secret(cred.get("totp_secret"))
+        if not secret:
+            missing.append(email)
+            continue
+        password = str(cred.get("password") or "").strip()
+        if not password:
+            password = str((db.get_account(email) or {}).get("password") or "").strip()
+        lines.append(twofa.copy_line(email, password, secret))
+    return lines, missing
 
 
 def _request_account_status(access_token: str, proxy: str = "") -> tuple[int, dict]:

@@ -11,7 +11,7 @@ from unittest import mock
 
 from auth_flow import AuthFlow, AuthResult
 from log_safety import redact_sensitive_text
-from webui import account_ops, app, db
+from webui import account_ops, app, db, twofa
 
 
 def jwt(payload: dict) -> str:
@@ -29,12 +29,14 @@ class TempDatabaseTest(unittest.TestCase):
         with account_ops._lock:
             account_ops._tasks.clear()
             account_ops._active_rt_by_email.clear()
+            account_ops._active_2fa_by_email.clear()
 
     def tearDown(self):
         db.DB_PATH = self.original_db_path
         with account_ops._lock:
             account_ops._tasks.clear()
             account_ops._active_rt_by_email.clear()
+            account_ops._active_2fa_by_email.clear()
         self.tempdir.cleanup()
 
     def save(self, email: str, *, rt: str = "", at: str = "web-at", st: str = "web-st"):
@@ -301,6 +303,245 @@ class ExistingAccountRtTests(TempDatabaseTest):
         self.assertFalse(first_reused)
         self.assertTrue(second_reused)
         self.assertEqual(second_id, first_id)
+
+
+class TwoFactorTests(TempDatabaseTest):
+    SECRET = "JBSWY3DPEHPK3PXP"
+
+    def setUp(self):
+        super().setUp()
+        self.flow = mock.Mock()
+        self.flow._build_chatgpt_cookie_header.return_value = "safe-cookie"
+        self.web_session = {
+            "access_token": "fresh-web-at",
+            "session_token": "fresh-st",
+            "mfa": False,
+            "email": "person@example.com",
+        }
+
+    def patch_flow(self):
+        return mock.patch.object(account_ops, "AuthFlow", return_value=self.flow)
+
+    def test_totp_matches_rfc6238_reference_vector(self):
+        secret = base64.b32encode(b"12345678901234567890").decode()
+        self.assertEqual(twofa.totp_now(secret, at=59), "287082")
+        self.assertEqual(twofa.totp_now(secret, at=1111111109), "081804")
+        self.assertEqual(twofa.totp_now("jbswy 3dpe-hpk3pxp"), twofa.totp_now(self.SECRET))
+
+    def test_direct_enroll_persists_secret_without_email_reauth(self):
+        self.save("person@example.com", at="stale-web-at")
+        with (
+            self.patch_flow(),
+            mock.patch.object(account_ops.twofa, "fetch_web_session", return_value=self.web_session),
+            mock.patch.object(
+                account_ops.twofa, "enroll_totp", return_value=(self.SECRET, "sess-1")
+            ),
+            mock.patch.object(account_ops.twofa, "activate_totp") as activate,
+            mock.patch.object(account_ops.twofa, "trigger_reauth") as reauth,
+        ):
+            task_id, reused = account_ops.start_totp_bind(["person@example.com"])
+            task = self.wait_task(task_id)
+
+        self.assertFalse(reused)
+        self.assertEqual(task["state"], "done")
+        self.assertEqual(task["succeeded"], 1)
+        reauth.assert_not_called()
+        activate.assert_called_once_with(self.flow, "fresh-web-at", self.SECRET, "sess-1")
+        stored = db.get_registered("person@example.com")
+        self.assertEqual(stored["totp_secret"], self.SECRET)
+        self.assertEqual(stored["access_token"], "fresh-web-at")
+        row = db.list_registered()[0]
+        self.assertEqual(row["totp_len"], len(self.SECRET))
+
+    def test_stale_login_falls_back_to_mailbox_reauth(self):
+        db.import_accounts(
+            "person@example.com----mail-pass----client-id----mail-refresh-token-long"
+        )
+        self.save("person@example.com")
+        reauth_session = {**self.web_session, "access_token": "reauth-web-at"}
+        with (
+            self.patch_flow(),
+            mock.patch.object(account_ops.time, "sleep"),
+            mock.patch.object(account_ops.twofa, "fetch_web_session", return_value=self.web_session),
+            mock.patch.object(
+                account_ops.twofa,
+                "enroll_totp",
+                side_effect=[
+                    twofa.TwoFactorProtocolError("注册 TOTP 失败 (HTTP 401)", status=401),
+                    (self.SECRET, "sess-2"),
+                ],
+            ),
+            mock.patch.object(account_ops.twofa, "activate_totp") as activate,
+            mock.patch.object(account_ops.twofa, "trigger_reauth", return_value="https://auth/x"),
+            mock.patch.object(account_ops.twofa, "follow_reauth"),
+            mock.patch.object(
+                account_ops.twofa, "validate_reauth_otp", return_value="https://continue"
+            ) as validate,
+            mock.patch.object(
+                account_ops.twofa, "exchange_web_session", return_value=reauth_session
+            ),
+            mock.patch.object(account_ops, "OutlookMailProvider") as provider,
+        ):
+            provider.return_value.wait_for_otp.return_value = "123456"
+            secret = account_ops._bind_two_factor("person@example.com", otp_timeout=60)
+
+        self.assertEqual(secret, self.SECRET)
+        validate.assert_called_once_with(self.flow, "123456")
+        activate.assert_called_once_with(self.flow, "reauth-web-at", self.SECRET, "sess-2")
+        self.assertEqual(provider.call_args.kwargs["client_id"], "client-id")
+        self.assertEqual(
+            provider.return_value.wait_for_otp.call_args.kwargs["timeout"], 60
+        )
+        self.assertEqual(db.get_registered("person@example.com")["totp_secret"], self.SECRET)
+
+    def test_account_with_openai_side_2fa_fails_with_actionable_code(self):
+        self.save("person@example.com")
+        with (
+            self.patch_flow(),
+            mock.patch.object(
+                account_ops.twofa,
+                "fetch_web_session",
+                return_value={**self.web_session, "mfa": True},
+            ),
+            mock.patch.object(account_ops.twofa, "enroll_totp") as enroll,
+        ):
+            task = self.wait_task(account_ops.start_totp_bind(["person@example.com"])[0])
+
+        enroll.assert_not_called()
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["errors"][0]["code"], "TWO_FA_ALREADY_BOUND")
+        self.assertIn("关闭二步验证", task["action_required"])
+        self.assertEqual(db.get_registered("person@example.com")["totp_secret"], "")
+
+    def test_bound_account_is_idempotent_and_never_touches_network(self):
+        self.save("person@example.com")
+        db.update_registered_fields("person@example.com", totp_secret=self.SECRET)
+        with mock.patch.object(account_ops, "AuthFlow") as flow_cls:
+            task = self.wait_task(account_ops.start_totp_bind(["person@example.com"])[0])
+        flow_cls.assert_not_called()
+        self.assertEqual(task["state"], "done")
+
+    def test_duplicate_bind_click_reuses_running_task(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_bind(_email, **_kwargs):
+            started.set()
+            release.wait(1)
+            return self.SECRET
+
+        with mock.patch.object(account_ops, "_bind_two_factor", side_effect=slow_bind):
+            first_id, first_reused = account_ops.start_totp_bind(["person@example.com"])
+            self.assertTrue(started.wait(1))
+            second_id, second_reused = account_ops.start_totp_bind(["person@example.com"])
+            release.set()
+            self.wait_task(first_id)
+
+        self.assertFalse(first_reused)
+        self.assertTrue(second_reused)
+        self.assertEqual(second_id, first_id)
+
+    def test_copy_lines_join_account_password_secret_and_report_missing(self):
+        db.import_accounts(
+            "person@example.com----mail-pass----client-id----mail-refresh-token-long"
+        )
+        self.save("person@example.com")
+        self.save("plain@example.com")
+        db.update_registered_fields("person@example.com", totp_secret=self.SECRET)
+
+        response = app.api_two_factor_lines(
+            app.TwoFactorCopyReq(emails=["person@example.com", "plain@example.com"])
+        )
+        payload = json.loads(response.body)
+
+        self.assertEqual(
+            payload["lines"], [f"person@example.com----mail-pass----{self.SECRET}"]
+        )
+        self.assertEqual(payload["missing"], ["plain@example.com"])
+        self.assertIn("no-store", response.headers["cache-control"])
+
+    def test_copy_lines_reject_request_without_any_secret(self):
+        self.save("plain@example.com")
+        with self.assertRaises(Exception):
+            app.api_two_factor_lines(app.TwoFactorCopyReq(emails=["plain@example.com"]))
+
+    def test_resaving_account_keeps_existing_secret(self):
+        self.save("person@example.com")
+        db.update_registered_fields("person@example.com", totp_secret=self.SECRET)
+        self.save("person@example.com", at="re-registered-at")
+        self.assertEqual(db.get_registered("person@example.com")["totp_secret"], self.SECRET)
+
+
+class PlanFilterTests(TempDatabaseTest):
+    def seed(self, email: str, status: str, label: str):
+        self.save(email, rt="rt" if status == "plus_active" else "")
+        db.update_plus_check(email, {"status": status, "label": label, "checked_at": 1.0})
+
+    def test_plus_filter_matches_the_plus_metric_scope(self):
+        self.seed("active@example.com", "plus_active", "Plus")
+        self.seed("promo@example.com", "plus_promo", "优惠")
+        self.seed("trial@example.com", "plus_eligible", "Plus 试用")
+        self.seed("free@example.com", "free", "Free")
+        self.seed("banned@example.com", "banned", "已停用")
+        self.save("unchecked@example.com")
+
+        result = app.api_registered(limit=50, filter="plus")
+
+        self.assertEqual(
+            sorted(item["email"] for item in result["items"]),
+            ["active@example.com", "promo@example.com", "trial@example.com"],
+        )
+        self.assertEqual(result["total"], 3)
+        # 顶部「Plus / 优惠 / 试用」卡片与筛选必须同口径
+        self.assertEqual(result["summary"]["plus"], 3)
+        self.assertEqual(db.count_registered("all"), 6)
+
+    def test_plus_filter_paginates_on_the_filtered_set(self):
+        for index in range(5):
+            self.seed(f"plus{index}@example.com", "plus_active", "Plus")
+            self.seed(f"free{index}@example.com", "free", "Free")
+
+        first = app.api_registered(limit=3, offset=0, filter="plus")
+        second = app.api_registered(limit=3, offset=3, filter="plus")
+
+        self.assertEqual(first["total"], 5)
+        self.assertEqual(len(first["items"]), 3)
+        self.assertEqual(len(second["items"]), 2)
+        self.assertTrue(
+            all(item["email"].startswith("plus") for item in first["items"] + second["items"])
+        )
+
+    def test_unknown_filter_falls_back_to_all(self):
+        self.seed("free@example.com", "free", "Free")
+        self.assertEqual(app.api_registered(filter="'; DROP TABLE registered--")["total"], 1)
+
+    def test_plan_status_column_is_backfilled_from_legacy_extra_json(self):
+        legacy = Path(self.tempdir.name) / "legacy.db"
+        original = db.DB_PATH
+        db.DB_PATH = legacy
+        try:
+            con = db._conn()
+            con.execute("""
+                CREATE TABLE registered (
+                    email TEXT PRIMARY KEY, password TEXT, access_token TEXT,
+                    session_token TEXT, refresh_token TEXT, id_token TEXT,
+                    device_id TEXT, csrf_token TEXT, cookie_header TEXT,
+                    extra_json TEXT, created_at REAL
+                )
+            """)
+            con.execute(
+                "INSERT INTO registered (email, extra_json, created_at) VALUES (?, ?, ?)",
+                ("legacy@example.com", json.dumps({"plus_check": {"status": "plus_promo"}}), 1.0),
+            )
+            con.commit()
+            con.close()
+
+            db.init_db()
+
+            self.assertEqual(db.count_registered("plus"), 1)
+            self.assertEqual(db.registered_summary()["plus"], 1)
+        finally:
+            db.DB_PATH = original
 
 
 class LogSafetyTests(unittest.TestCase):

@@ -43,6 +43,7 @@
     <section class="toolbar" aria-label="账号工具栏">
       <div class="segment" id="filterSegment">
         <button class="active" data-filter="all">全部</button>
+        <button data-filter="plus" title="Plus / 优惠 / 试用">Plus</button>
         <button data-filter="has_rt">有 RT</button>
         <button data-filter="no_rt">无 RT</button>
       </div>
@@ -50,21 +51,22 @@
       <span class="selection-note">已选 <b id="selectedCount">0</b></span>
       <button id="copyAtBtn" disabled><i data-lucide="copy"></i>复制 AT</button>
       <button id="copyEmailBtn" disabled><i data-lucide="mail"></i>获取邮箱</button>
+      <button id="copy2faBtn" disabled title="复制「账号----密码----2FA 密钥」"><i data-lucide="shield-check"></i>复制 2FA</button>
       <button id="acquireRtBtn" disabled><i data-lucide="key"></i>获取 RT</button>
       <button id="statusSelectedBtn" disabled><i data-lucide="activity"></i>刷新选中状态</button>
       <button id="statusPageBtn"><i data-lucide="scan-search"></i>刷新当前页</button>
       <button id="downloadBtn" class="primary" disabled><i data-lucide="download"></i>下载 Sub2API</button>
       <span class="spacer"></span>
-      <input id="proxyInput" class="control" style="width:210px" placeholder="状态/登录代理（可选）">
+      <input id="proxyInput" class="control" placeholder="状态/登录代理（可选）">
     </section>
 
     <section class="table-card">
       <div class="table-scroll" id="tableScroll">
         <table id="accountsTable">
           <colgroup>
-            <col style="width:35px"><col style="width:20%"><col style="width:12%">
-            <col style="width:8%"><col style="width:8%"><col style="width:8%">
-            <col style="width:13%"><col>
+            <col style="width:35px"><col style="width:19%"><col style="width:11%">
+            <col style="width:7%"><col style="width:7%"><col style="width:7%">
+            <col style="width:11%"><col>
           </colgroup>
           <thead>
             <tr>

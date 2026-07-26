@@ -97,16 +97,22 @@ h1 { margin: 0; font-family: "Avenir Next", "PingFang SC", sans-serif; font-size
 .metric span { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
 
 .toolbar {
-  flex: 0 0 42px;
+  flex: 0 0 auto;
   min-height: 42px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   padding: 5px 8px;
   background: var(--surface);
   border: 1px solid var(--line);
 }
-.toolbar .spacer { flex: 1; }
+/* 按钮保持整块宽度：宽度不够时整个按钮换行，而不是把标签压成两行 */
+.toolbar > * { flex: 0 0 auto; }
+.toolbar > button { padding: 0 9px; }
+.toolbar .spacer { flex: 1 1 0; }
+/* 代理输入框可伸缩：窄屏先让它变窄留在同一行，宽屏再撑回原宽度 */
+.toolbar #proxyInput { flex: 1 1 140px; min-width: 120px; max-width: 210px; margin-left: auto; }
 .control, button {
   height: 30px;
   border: 1px solid var(--line-strong);
@@ -115,7 +121,7 @@ h1 { margin: 0; font-family: "Avenir Next", "PingFang SC", sans-serif; font-size
   color: var(--ink);
 }
 select.control, input.control { padding: 0 9px; }
-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 10px; cursor: pointer; font-weight: 650; }
+button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 10px; cursor: pointer; font-weight: 650; white-space: nowrap; }
 button:hover { border-color: #9da9a3; background: var(--surface-muted); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 button.primary { color: #fff; border-color: var(--blue); background: var(--blue); }
@@ -168,6 +174,7 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--blue); }
 .icon-action { width: 27px; height: 27px; flex: 0 0 27px; padding: 0; }
 .icon-action svg { width: 13px; }
 .text-action { height: 27px; padding: 0 7px; font-size: 10px; }
+.text-action.bound { color: var(--green); border-color: #bcdccc; background: #f3fbf7; }
 
 .table-footer { flex: 0 0 39px; display: flex; align-items: center; padding: 4px 8px; border-top: 1px solid var(--line); background: var(--surface-muted); }
 .pager { margin-left: auto; display: flex; align-items: center; gap: 7px; }

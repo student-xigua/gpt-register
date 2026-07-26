@@ -9,6 +9,7 @@ const state = {
   selected: new Set(),
   taskTimer: null,
   activeRtEmails: new Set(),
+  active2faEmails: new Set(),
   modalData: null,
 };
 
@@ -23,7 +24,7 @@ function selectedEmails() {
 function updateSelection() {
   const count = state.selected.size;
   $("#selectedCount").textContent = count;
-  for (const id of ["copyAtBtn", "copyEmailBtn", "statusSelectedBtn"]) {
+  for (const id of ["copyAtBtn", "copyEmailBtn", "copy2faBtn", "statusSelectedBtn"]) {
     $(`#${id}`).disabled = count === 0;
   }
   $("#acquireRtBtn").disabled = count === 0
@@ -57,6 +58,8 @@ function renderRows() {
   body.innerHTML = state.rows.map(row => {
     const checkedAt = row.plus_check?.checked_at;
     const rtBusy = state.activeRtEmails.has(row.email);
+    const twoFaBusy = state.active2faEmails.has(row.email);
+    const twoFaBound = row.totp_len > 0;
     return `<tr>
       <td class="check-cell"><input class="row-check" type="checkbox" data-email="${escapeHtml(row.email)}" ${state.selected.has(row.email) ? "checked" : ""}></td>
       <td><span class="truncate email" title="${escapeHtml(row.email)}">${escapeHtml(row.email)}</span><span class="subline">录入 ${fmtTime(row.created_at)}</span></td>
@@ -70,6 +73,7 @@ function renderRows() {
         <button class="icon-action" data-action="email" data-email="${escapeHtml(row.email)}" title="获取原始邮箱四段"><i data-lucide="mail"></i></button>
         <button class="text-action" data-action="status" data-email="${escapeHtml(row.email)}" title="实时刷新账号状态">状态</button>
         <button class="text-action" data-action="acquire-rt" data-email="${escapeHtml(row.email)}" title="${rtBusy ? "RT 获取任务进行中" : "重新 OTP 登录获取 RT"}" ${rtBusy ? "disabled" : ""}>${rtBusy ? "处理中" : "取 RT"}</button>
+        <button class="text-action${twoFaBound ? " bound" : ""}" data-action="${twoFaBound ? "copy-2fa" : "bind-2fa"}" data-email="${escapeHtml(row.email)}" title="${twoFaBusy ? "2FA 绑定任务进行中" : twoFaBound ? "复制 账号----密码----2FA 密钥" : "邮箱重认证后绑定 2FA"}" ${twoFaBusy ? "disabled" : ""}>${twoFaBusy ? "处理中" : twoFaBound ? "2FA" : "绑 2FA"}</button>
         <button class="icon-action" data-action="download" data-email="${escapeHtml(row.email)}" title="下载 Sub2API JSON" ${row.rt_len ? "" : "disabled"}><i data-lucide="download"></i></button>
         <button class="icon-action danger" data-action="delete" data-email="${escapeHtml(row.email)}" title="删除账号"><i data-lucide="trash-2"></i></button>
       </div></td>
@@ -142,12 +146,23 @@ async function copySourceEmails(emails) {
   setToast(`已复制 ${values.length} 条邮箱四段${failed.length ? `，${failed.length} 条未找到` : ""}`, "ok");
 }
 
+async function copyTwoFactor(emails) {
+  const result = await api("api/account-management/2fa/lines", {
+    method: "POST",
+    body: JSON.stringify({ emails }),
+  });
+  await copyText(result.lines.join("\n"));
+  const missing = result.missing?.length || 0;
+  setToast(`已复制 ${result.lines.length} 条 2FA${missing ? `，跳过 ${missing} 个未绑定账号` : ""}`, "ok");
+}
+
 function showCredential(email, data) {
   state.modalData = data;
   $("#modalTitle").textContent = email;
   const fields = [
     ["email", "邮箱"], ["access_token", "Access Token"], ["session_token", "Session Token"],
     ["refresh_token", "Refresh Token"], ["id_token", "ID Token"],
+    ["totp_secret", "2FA 密钥"],
     ["device_id", "Device ID"], ["cookie_header", "Cookie"],
   ];
   $("#modalBody").innerHTML = fields.map(([key, label]) => `
@@ -169,14 +184,15 @@ async function startTask(path, emails, label) {
       otp_timeout: 180,
     }),
   });
-  const isRtTask = path.includes("acquire-rt");
-  if (isRtTask) {
-    emails.forEach(email => state.activeRtEmails.add(email));
+  const busySet = path.includes("acquire-rt") ? state.activeRtEmails
+    : path.includes("bind-2fa") ? state.active2faEmails : null;
+  if (busySet) {
+    emails.forEach(email => busySet.add(email));
     renderRows();
     updateSelection();
-    if (result.reused) setToast("该账号已有获取 RT 任务，已继续查看原任务", "ok");
+    if (result.reused) setToast("该账号已有同类任务在跑，已继续查看原任务", "ok");
   }
-  watchTask(result.task_id, label, isRtTask ? emails : []);
+  watchTask(result.task_id, label, busySet ? { set: busySet, emails } : null);
 }
 
 function renderTaskEvents(events = []) {
@@ -193,14 +209,14 @@ function renderTaskEvents(events = []) {
   `).join("");
 }
 
-function watchTask(taskId, label, rtEmails = []) {
+function watchTask(taskId, label, busy = null) {
   clearTimeout(state.taskTimer);
   $("#taskDrawer").classList.remove("hidden");
   $("#taskTitle").textContent = label;
   $("#taskState").textContent = "等待";
   $("#taskState").className = "task-state";
   $("#taskPhase").textContent = "等待执行";
-  $("#taskMeta").textContent = `0 / ${rtEmails.length || "—"}`;
+  $("#taskMeta").textContent = `0 / ${busy?.emails.length || "—"}`;
   $("#taskDetail").textContent = "任务正在排队";
   $("#taskActionRequired").textContent = "";
   $("#taskActionRequired").classList.add("hidden");
@@ -229,7 +245,7 @@ function watchTask(taskId, label, rtEmails = []) {
         $("#taskDownloadBtn").dataset.taskId = taskId;
       }
       if (["done", "partial", "failed"].includes(task.state)) {
-        rtEmails.forEach(email => state.activeRtEmails.delete(email));
+        busy?.emails.forEach(email => busy.set.delete(email));
         const tone = task.succeeded ? "ok" : "bad";
         setToast(task.message, tone);
         await refresh(false);
@@ -293,6 +309,10 @@ $("#accountsTable").addEventListener("click", async event => {
       showCredential(email, await getCredential(email));
     } else if (action === "email") {
       await copySourceEmails([email]);
+    } else if (action === "copy-2fa") {
+      await copyTwoFactor([email]);
+    } else if (action === "bind-2fa") {
+      await startTask("api/account-management/tasks/bind-2fa", [email], "绑定 2FA");
     } else if (action === "status") {
       await startTask("api/account-management/tasks/refresh-status", [email], "刷新账号状态");
     } else if (action === "acquire" || action === "acquire-rt") {
@@ -313,6 +333,7 @@ $("#accountsTable").addEventListener("click", async event => {
 
 $("#copyAtBtn").addEventListener("click", () => copyTokens(selectedEmails()).catch(error => setToast(error.message, "bad")));
 $("#copyEmailBtn").addEventListener("click", () => copySourceEmails(selectedEmails()).catch(error => setToast(error.message, "bad")));
+$("#copy2faBtn").addEventListener("click", () => copyTwoFactor(selectedEmails()).catch(error => setToast(error.message, "bad")));
 $("#acquireRtBtn").addEventListener("click", () => startTask("api/account-management/tasks/acquire-rt", selectedEmails(), "批量获取 RT").catch(error => setToast(error.message, "bad")));
 $("#statusSelectedBtn").addEventListener("click", () => startTask("api/account-management/tasks/refresh-status", selectedEmails(), "刷新选中账号状态").catch(error => setToast(error.message, "bad")));
 $("#statusPageBtn").addEventListener("click", () => startTask("api/account-management/tasks/refresh-status", state.rows.map(row => row.email), "刷新当前页状态").catch(error => setToast(error.message, "bad")));

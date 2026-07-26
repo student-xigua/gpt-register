@@ -13,7 +13,7 @@ _KEY_VALUE_RE = re.compile(
         ["']?
         (?:
             access_token|refresh_token|session_token|id_token|
-            api_key|client_secret|password|
+            api_key|client_secret|totp_secret|secret|password|
             login_verifier|code_verifier|
             otp|otp_code|phone_number|activation_id
         )
