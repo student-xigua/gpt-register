@@ -24,6 +24,7 @@ from config import Config
 from fingerprint import generate_fingerprint, ua_for_impersonate
 from mail_outlook import OutlookMailProvider as MailProvider
 from http_client import create_http_session, USER_AGENT
+from log_safety import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,9 @@ class AuthFlow:
         self._client_auth_session_id: str = ""
         self._dump_login_verifier: str = ""
         self._codex_rt_attempted: bool = False
+        # 供账号管理任务读取的安全诊断，不包含响应 body 或凭证。
+        self.codex_rt_error_code: str = ""
+        self.codex_rt_error_message: str = ""
         self._trace_dump_enabled = str(os.getenv("AUTH_TRACE_DUMP", "0")).lower() in ("1", "true", "yes", "on")
         self._trace_include_cookie = str(os.getenv("AUTH_TRACE_INCLUDE_COOKIE", "0")).lower() in (
             "1", "true", "yes", "on"
@@ -273,9 +277,9 @@ class AuthFlow:
                 if one:
                     set_cookie_list = [one]
             set_cookie_raw = " || ".join(set_cookie_list)
-            set_cookie = set_cookie_raw[:260]
+            set_cookie = "[cookie hidden]" if set_cookie_raw else ""
             body = (resp.text or "").replace("\n", " ").replace("\r", " ")
-            body = body[:260]
+            body = redact_sensitive_text(body, max_length=260)
             req_headers_lc = {(str(k).lower()): v for k, v in (req_headers or {}).items()}
 
             if self._http_trace_enabled:
@@ -293,7 +297,7 @@ class AuthFlow:
                     body,
                 )
                 if self._trace_include_cookie and req_cookie:
-                    logger.info("[HTTP TRACE] %s | req_cookie=%s", step, req_cookie[:360])
+                    logger.info("[HTTP TRACE] %s | req_cookie=[cookie hidden]", step)
 
             # 从多处信息中抓取 login_verifier/code_verifier
             self._sniff_login_verifier(req_url, f"{step}:req_url")
@@ -313,7 +317,7 @@ class AuthFlow:
                         "request": {
                             "method": method,
                             "url": req_url,
-                            "body": req_body[:120000],
+                            "body": redact_sensitive_text(req_body, max_length=120000),
                             "headers": {
                                 "Content-Type": (req_headers_lc.get("content-type", "") or "")[:240],
                                 "Accept": (req_headers_lc.get("accept", "") or "")[:240],
@@ -321,7 +325,7 @@ class AuthFlow:
                                 "Origin": (req_headers_lc.get("origin", "") or "")[:120],
                                 **(
                                     {
-                                        "Cookie": (req_headers_lc.get("cookie", "") or "")[:6000],
+                                        "Cookie": "[cookie hidden]",
                                     }
                                     if include_req_cookie
                                     else {}
@@ -331,17 +335,17 @@ class AuthFlow:
                         "response": {
                             "status_code": status,
                             "url": final_url,
-                            "location": resp.headers.get("Location", ""),
+                            "location": redact_sensitive_text(resp.headers.get("Location", "")),
                             "x_request_id": resp.headers.get("x-request-id", ""),
                             "content_type": resp.headers.get("Content-Type", ""),
-                            "set_cookie": set_cookie_raw,
-                            "set_cookie_list": set_cookie_list,
-                            "body": raw_text[:120000],
+                            "set_cookie": "[cookie hidden]" if set_cookie_raw else "",
+                            "set_cookie_list": ["[cookie hidden]"] if set_cookie_list else [],
+                            "body": redact_sensitive_text(raw_text, max_length=120000),
                         },
-                        "captured_login_verifier": self._captured_login_verifier,
+                        "captured_login_verifier": "[verifier hidden]" if self._captured_login_verifier else "",
                     }
                     if self._trace_include_cookie and req_cookie:
-                        record["request"]["headers"]["Cookie"] = req_cookie[:8000]
+                        record["request"]["headers"]["Cookie"] = "[cookie hidden]"
                     with open(self._trace_dump_path, "a", encoding="utf-8") as fw:
                         fw.write(json.dumps(record, ensure_ascii=False) + "\n")
                 except Exception as e:
@@ -1267,6 +1271,8 @@ class AuthFlow:
             logger.debug("Codex RT 本轮已尝试过，跳过重复尝试")
             return False
         self._codex_rt_attempted = True
+        self.codex_rt_error_code = ""
+        self.codex_rt_error_message = ""
 
         logger.info("尝试 Codex OAuth 直连换取 refresh_token ...")
         try:
@@ -1320,27 +1326,34 @@ class AuthFlow:
 
             # Codex authorize 直接被打到 /add-phone（不经过 /log-in）：
             # 如果配了 SMS 接码 controller，先把手机号绑了再重新 authorize
-            if (not callback_url) and self._is_add_phone_state(page_type="", continue_url=final_url or "") \
-                    and (self._sms_callback is not None or self._sms_required):
-                logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
-                try:
-                    self._handle_add_phone_verification(continue_url=final_url)
-                    # 绑号成功后重新 authorize 拿 callback code
-                    callback_url, final_url = self._follow_authorize_for_callback(
-                        auth_url, redirect_uri, "codex_authorize_after_add_phone"
-                    )
-                    if not callback_url:
-                        no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
-                        if no_prompt_url and no_prompt_url != auth_url:
-                            callback_url, final_url = self._follow_authorize_for_callback(
-                                no_prompt_url,
-                                redirect_uri,
-                                "codex_authorize_noprompt_after_add_phone",
-                            )
-                except SmsRequiredError:
-                    raise
-                except Exception as e:
-                    logger.warning(f"SMS 接码绑号失败: {e}")
+            direct_add_phone = (
+                (not callback_url)
+                and self._is_add_phone_state(page_type="", continue_url=final_url or "")
+            )
+            if direct_add_phone:
+                if self._sms_callback is not None or self._sms_required:
+                    logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
+                    try:
+                        self._handle_add_phone_verification(continue_url=final_url)
+                        # 绑号成功后重新 authorize 拿 callback code
+                        callback_url, final_url = self._follow_authorize_for_callback(
+                            auth_url, redirect_uri, "codex_authorize_after_add_phone"
+                        )
+                        if not callback_url:
+                            no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
+                            if no_prompt_url and no_prompt_url != auth_url:
+                                callback_url, final_url = self._follow_authorize_for_callback(
+                                    no_prompt_url,
+                                    redirect_uri,
+                                    "codex_authorize_noprompt_after_add_phone",
+                                )
+                    except SmsRequiredError:
+                        raise
+                    except Exception as e:
+                        logger.warning("SMS 接码绑号失败: %s", redact_sensitive_text(e, max_length=180))
+                else:
+                    self.codex_rt_error_code = "PHONE_BINDING_REQUIRED"
+                    self.codex_rt_error_message = "Codex 授权要求绑定手机号，但接码未启用"
 
             # 兜底：去掉 prompt=login 再发起一次授权
             if not callback_url:
@@ -1353,19 +1366,34 @@ class AuthFlow:
                     )
 
             if not callback_url:
+                if self._is_add_phone_state(page_type="", continue_url=final_url or ""):
+                    self.codex_rt_error_code = "PHONE_BINDING_REQUIRED"
+                    self.codex_rt_error_message = "Codex 授权要求绑定手机号，未能继续换取 RT"
+                elif not self.codex_rt_error_code:
+                    self.codex_rt_error_code = "CODEX_CALLBACK_MISSING"
+                    self.codex_rt_error_message = "Codex 授权未返回 callback"
                 logger.debug("Codex OAuth 未捕获 callback code, final=%s", (final_url or "")[:180])
                 return False
-            return self._exchange_codex_callback_code(
+            exchanged = self._exchange_codex_callback_code(
                 callback_url=callback_url,
                 expected_state=state,
                 verifier=verifier,
                 redirect_uri=redirect_uri,
                 client_id=client_id,
             )
+            if exchanged:
+                self.codex_rt_error_code = ""
+                self.codex_rt_error_message = ""
+            else:
+                self.codex_rt_error_code = "CODEX_TOKEN_EXCHANGE_FAILED"
+                self.codex_rt_error_message = "Codex callback 已取得，但 token 交换失败"
+            return exchanged
         except SmsRequiredError:
             raise
         except Exception as e:
-            logger.warning(f"Codex OAuth 交换异常: {e}")
+            self.codex_rt_error_code = "CODEX_OAUTH_ERROR"
+            self.codex_rt_error_message = "Codex OAuth 交换异常"
+            logger.warning("Codex OAuth 交换异常: %s", redact_sensitive_text(e, max_length=180))
             return False
 
     def _inject_pkce_into_auth_url(self, auth_url: str) -> str:
@@ -2159,13 +2187,13 @@ class AuthFlow:
                     resp = self.session.post(url, headers=h, data=body_str, timeout=30)
                 self._trace_http(f"choose_account_try_{kind}_{url.rsplit('/', 1)[-1][:30]}", resp)
                 status = getattr(resp, "status_code", 0)
-                snippet = (getattr(resp, "text", "") or "")[:240].replace("\n", " ")
                 loc = (getattr(resp, "headers", {}) or {}).get("Location", "") or \
                       (getattr(resp, "headers", {}) or {}).get("location", "") or ""
-                # print 到 stdout 让 webui SSE 能看到每个候选的具体结果
+                loc_path = urlparse(loc).path[:120] if loc else ""
+                # 只输出状态与路径，避免认证响应 body / query 泄漏到 journal。
                 print(
                     f"[choose-an-account] {method} {url} [{kind}] -> "
-                    f"status={status} loc={loc[:120]} body={snippet}",
+                    f"status={status} next_path={loc_path or '(response-json)'}",
                     flush=True,
                 )
                 if status in (200, 201, 302, 303):

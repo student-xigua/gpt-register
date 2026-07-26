@@ -977,7 +977,7 @@ class PhoneCallbackController:
         self.log(f"⏳ 等待 SMS 验证码... (activation_id={self.activation.activation_id} timeout={timeout}s)")
         code = provider.get_code(self.activation.activation_id, timeout=timeout)
         if code:
-            self.log(f"✅ 收到 SMS 验证码: {code}")
+            self.log("✅ 已收到 SMS 验证码")
             if getattr(provider, "auto_report_success_on_code", True):
                 self.report_success()
         else:

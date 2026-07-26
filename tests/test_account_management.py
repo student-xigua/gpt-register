@@ -3,12 +3,14 @@ from __future__ import annotations
 import base64
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from auth_flow import AuthResult
+from auth_flow import AuthFlow, AuthResult
+from log_safety import redact_sensitive_text
 from webui import account_ops, app, db
 
 
@@ -26,11 +28,13 @@ class TempDatabaseTest(unittest.TestCase):
         db.init_db()
         with account_ops._lock:
             account_ops._tasks.clear()
+            account_ops._active_rt_by_email.clear()
 
     def tearDown(self):
         db.DB_PATH = self.original_db_path
         with account_ops._lock:
             account_ops._tasks.clear()
+            account_ops._active_rt_by_email.clear()
         self.tempdir.cleanup()
 
     def save(self, email: str, *, rt: str = "", at: str = "web-at", st: str = "web-st"):
@@ -114,6 +118,30 @@ class Sub2DownloadTests(TempDatabaseTest):
 
 
 class ExistingAccountRtTests(TempDatabaseTest):
+    def test_codex_add_phone_records_safe_failure_code(self):
+        flow = object.__new__(AuthFlow)
+        flow._codex_rt_attempted = False
+        flow._sms_callback = None
+        flow._sms_required = False
+        flow.codex_rt_error_code = ""
+        flow.codex_rt_error_message = ""
+        flow._build_codex_authorize = mock.Mock(return_value=(
+            "https://auth.openai.com/oauth/authorize?prompt=login",
+            "state",
+            "verifier",
+            "http://localhost/callback",
+            "client",
+        ))
+        flow._follow_authorize_for_callback = mock.Mock(
+            return_value=("", "https://auth.openai.com/add-phone")
+        )
+        flow._exchange_codex_callback_code = mock.Mock()
+
+        self.assertFalse(flow.oauth_codex_rt_exchange())
+        self.assertEqual(flow.codex_rt_error_code, "PHONE_BINDING_REQUIRED")
+        self.assertIn("绑定手机号", flow.codex_rt_error_message)
+        flow._exchange_codex_callback_code.assert_not_called()
+
     def test_fresh_protocol_login_never_allows_registration_fallback(self):
         db.import_accounts(
             "person@example.com----mail-pass----client-id----mail-refresh-token-long"
@@ -126,8 +154,10 @@ class ExistingAccountRtTests(TempDatabaseTest):
                 pass
 
         class FakeFlow:
-            def __init__(self, _config):
+            def __init__(self, _config, sms_callback=None, sms_required=False):
                 self.session = FakeSession()
+                seen["sms_callback"] = sms_callback
+                seen["sms_required"] = sms_required
 
             def run_protocol_login(
                 self, mail, email, password="", *, allow_registration_fallback=True,
@@ -153,6 +183,8 @@ class ExistingAccountRtTests(TempDatabaseTest):
             account_ops._login_existing_for_rt("person@example.com")
 
         self.assertFalse(seen["allow"])
+        self.assertIsNone(seen["sms_callback"])
+        self.assertFalse(seen["sms_required"])
         self.assertEqual(seen["password"], "mail-pass")
         source_call = provider.call_args.kwargs
         self.assertEqual(source_call["client_id"], "client-id")
@@ -160,6 +192,128 @@ class ExistingAccountRtTests(TempDatabaseTest):
         stored = db.get_registered("person@example.com")
         self.assertEqual(stored["refresh_token"], "new-openai-rt")
         self.assertEqual(stored["access_token"], "original-web-at")
+
+    def test_phone_binding_required_has_clear_code_and_action(self):
+        db.import_accounts(
+            "person@example.com----mail-pass----client-id----mail-refresh-token-long"
+        )
+        self.save("person@example.com", rt="", at="original-web-at")
+
+        class FakeSession:
+            def close(self):
+                pass
+
+        class FakeFlow:
+            codex_rt_error_code = "PHONE_BINDING_REQUIRED"
+            codex_rt_error_message = "Codex 授权要求绑定手机号"
+
+            def __init__(self, _config, **_kwargs):
+                self.session = FakeSession()
+
+            def run_protocol_login(self, *_args, **_kwargs):
+                result = AuthResult()
+                result.access_token = "temporary-login-at"
+                result.session_token = "temporary-session"
+                return result
+
+        with (
+            mock.patch.object(account_ops, "AuthFlow", FakeFlow),
+            mock.patch.object(account_ops, "OutlookMailProvider"),
+        ):
+            task_id, reused = account_ops.start_rt_login(["person@example.com"])
+            task = self.wait_task(task_id)
+
+        self.assertFalse(reused)
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["errors"][0]["code"], "PHONE_BINDING_REQUIRED")
+        self.assertIn("邮箱 OTP 和网页登录均成功", task["errors"][0]["error"])
+        self.assertIn("启用接码", task["action_required"])
+        self.assertEqual(db.get_registered("person@example.com")["refresh_token"], "")
+        self.assertFalse(task["download_ready"])
+
+    def test_enabled_sms_controller_is_injected_into_fresh_flow(self):
+        db.import_accounts(
+            "person@example.com----mail-pass----client-id----mail-refresh-token-long"
+        )
+        self.save("person@example.com", rt="")
+        controller = mock.Mock()
+        seen = {}
+
+        class FakeSession:
+            def close(self):
+                pass
+
+        class FakeFlow:
+            def __init__(self, _config, sms_callback=None, sms_required=False):
+                self.session = FakeSession()
+                seen["callback"] = sms_callback
+                seen["required"] = sms_required
+
+            def run_protocol_login(self, *_args, **_kwargs):
+                result = AuthResult()
+                result.refresh_token = "new-openai-rt"
+                return result
+
+        sms_cfg = {
+            "sms_enabled": True,
+            "sms_provider": "herosms",
+            "sms_api_key": "configured",
+        }
+        with (
+            mock.patch.object(account_ops.db, "get_sms_internal_config", return_value=sms_cfg),
+            mock.patch.object(account_ops, "build_sms_controller", return_value=controller) as build,
+            mock.patch.object(account_ops, "AuthFlow", FakeFlow),
+            mock.patch.object(account_ops, "OutlookMailProvider"),
+        ):
+            account_ops._login_existing_for_rt("person@example.com")
+
+        build.assert_called_once_with(
+            sms_cfg,
+            log_fn=mock.ANY,
+            require_complete=True,
+        )
+        self.assertIs(seen["callback"], controller)
+        self.assertTrue(seen["required"])
+
+    def test_duplicate_rt_click_reuses_running_task(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_login(email, **_kwargs):
+            started.set()
+            release.wait(1)
+            return {"email": email, "refresh_token": "rt"}
+
+        with (
+            mock.patch.object(account_ops, "_login_existing_for_rt", side_effect=slow_login),
+            mock.patch.object(
+                account_ops.exporter,
+                "refresh_codex_token",
+                side_effect=RuntimeError("download unavailable"),
+            ),
+        ):
+            first_id, first_reused = account_ops.start_rt_login(["person@example.com"])
+            self.assertTrue(started.wait(1))
+            second_id, second_reused = account_ops.start_rt_login(["person@example.com"])
+            release.set()
+            self.wait_task(first_id)
+
+        self.assertFalse(first_reused)
+        self.assertTrue(second_reused)
+        self.assertEqual(second_id, first_id)
+
+
+class LogSafetyTests(unittest.TestCase):
+    def test_redacts_credentials_but_keeps_diagnostic_meaning(self):
+        text = redact_sensitive_text(
+            'OTP=123456 refresh_token="secret-rt" '
+            'Authorization: Bearer abc.def.ghi code_verifier=verifier-value'
+        )
+        self.assertNotIn("123456", text)
+        self.assertNotIn("secret-rt", text)
+        self.assertNotIn("verifier-value", text)
+        self.assertIn("refresh_token", text)
+        self.assertIn("[hidden]", text)
 
 
 class EmailSourceTests(TempDatabaseTest):

@@ -107,10 +107,20 @@
   </div>
 </div>
 
-<aside class="task-drawer hidden" id="taskDrawer">
-  <div class="task-title"><i data-lucide="loader-circle"></i><span id="taskTitle">后台任务</span></div>
-  <div class="task-meta" id="taskMeta"></div>
+<aside class="task-drawer hidden" id="taskDrawer" aria-live="polite">
+  <div class="task-title">
+    <span class="task-icon"><i data-lucide="loader-circle"></i></span>
+    <span id="taskTitle">后台任务</span>
+    <span class="task-state" id="taskState">等待</span>
+  </div>
+  <div class="task-phase">
+    <b id="taskPhase">等待执行</b>
+    <span id="taskMeta">0 / 0</span>
+  </div>
   <div class="progress"><span id="taskProgress"></span></div>
+  <div class="task-detail" id="taskDetail">任务正在排队</div>
+  <div class="task-action-required hidden" id="taskActionRequired"></div>
+  <div class="task-events" id="taskEvents"></div>
   <div class="task-actions">
     <button id="taskCloseBtn">收起</button>
     <button id="taskDownloadBtn" class="primary" hidden><i data-lucide="download"></i>下载 JSON</button>

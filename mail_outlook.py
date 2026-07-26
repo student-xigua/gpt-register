@@ -247,7 +247,7 @@ def fetch_otp_via_graph(
                 otp = _extract_otp_from_html(body_content)
                 if otp:
                     logger.info(
-                        f"[outlook-graph] {email_addr} OTP={otp} folder={folder}"
+                        f"[outlook-graph] {email_addr} OTP=已获取 folder={folder}"
                     )
                     return otp
 
@@ -459,7 +459,7 @@ def fetch_otp_via_imap(
                     otp = _extract_otp_from_html(text_body)
                     if otp:
                         logger.info(
-                            f"[outlook-imap] {email_addr} OTP={otp} "
+                            f"[outlook-imap] {email_addr} OTP=已获取 "
                             f"folder={folder!r}"
                         )
                         try:

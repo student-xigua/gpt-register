@@ -8,6 +8,7 @@ const state = {
   rows: [],
   selected: new Set(),
   taskTimer: null,
+  activeRtEmails: new Set(),
   modalData: null,
 };
 
@@ -22,9 +23,11 @@ function selectedEmails() {
 function updateSelection() {
   const count = state.selected.size;
   $("#selectedCount").textContent = count;
-  for (const id of ["copyAtBtn", "copyEmailBtn", "acquireRtBtn", "statusSelectedBtn"]) {
+  for (const id of ["copyAtBtn", "copyEmailBtn", "statusSelectedBtn"]) {
     $(`#${id}`).disabled = count === 0;
   }
+  $("#acquireRtBtn").disabled = count === 0
+    || selectedEmails().some(email => state.activeRtEmails.has(email));
   const selectedWithRt = state.rows.some(row => state.selected.has(row.email) && row.rt_len > 0);
   $("#downloadBtn").disabled = !selectedWithRt;
   const visible = state.rows.map(row => row.email);
@@ -53,6 +56,7 @@ function renderRows() {
   }
   body.innerHTML = state.rows.map(row => {
     const checkedAt = row.plus_check?.checked_at;
+    const rtBusy = state.activeRtEmails.has(row.email);
     return `<tr>
       <td class="check-cell"><input class="row-check" type="checkbox" data-email="${escapeHtml(row.email)}" ${state.selected.has(row.email) ? "checked" : ""}></td>
       <td><span class="truncate email" title="${escapeHtml(row.email)}">${escapeHtml(row.email)}</span><span class="subline">录入 ${fmtTime(row.created_at)}</span></td>
@@ -65,7 +69,7 @@ function renderRows() {
         <button class="icon-action" data-action="view" data-email="${escapeHtml(row.email)}" title="查看凭证"><i data-lucide="eye"></i></button>
         <button class="icon-action" data-action="email" data-email="${escapeHtml(row.email)}" title="获取原始邮箱四段"><i data-lucide="mail"></i></button>
         <button class="text-action" data-action="status" data-email="${escapeHtml(row.email)}" title="实时刷新账号状态">状态</button>
-        <button class="text-action" data-action="acquire-rt" data-email="${escapeHtml(row.email)}" title="重新 OTP 登录获取 RT">取 RT</button>
+        <button class="text-action" data-action="acquire-rt" data-email="${escapeHtml(row.email)}" title="${rtBusy ? "RT 获取任务进行中" : "重新 OTP 登录获取 RT"}" ${rtBusy ? "disabled" : ""}>${rtBusy ? "处理中" : "取 RT"}</button>
         <button class="icon-action" data-action="download" data-email="${escapeHtml(row.email)}" title="下载 Sub2API JSON" ${row.rt_len ? "" : "disabled"}><i data-lucide="download"></i></button>
         <button class="icon-action danger" data-action="delete" data-email="${escapeHtml(row.email)}" title="删除账号"><i data-lucide="trash-2"></i></button>
       </div></td>
@@ -165,13 +169,43 @@ async function startTask(path, emails, label) {
       otp_timeout: 180,
     }),
   });
-  watchTask(result.task_id, label);
+  const isRtTask = path.includes("acquire-rt");
+  if (isRtTask) {
+    emails.forEach(email => state.activeRtEmails.add(email));
+    renderRows();
+    updateSelection();
+    if (result.reused) setToast("该账号已有获取 RT 任务，已继续查看原任务", "ok");
+  }
+  watchTask(result.task_id, label, isRtTask ? emails : []);
 }
 
-function watchTask(taskId, label) {
+function renderTaskEvents(events = []) {
+  const visible = events.slice(-8);
+  $("#taskEvents").innerHTML = visible.map(event => `
+    <div class="task-event ${escapeHtml(event.status || "running")}">
+      <span class="task-event-dot"></span>
+      <span class="task-event-label">${escapeHtml(event.label || event.phase || "处理")}</span>
+      <span class="task-event-detail">
+        ${escapeHtml(event.detail || "—")}
+        ${event.code ? `<code class="task-event-code">${escapeHtml(event.code)}</code>` : ""}
+      </span>
+    </div>
+  `).join("");
+}
+
+function watchTask(taskId, label, rtEmails = []) {
   clearTimeout(state.taskTimer);
   $("#taskDrawer").classList.remove("hidden");
   $("#taskTitle").textContent = label;
+  $("#taskState").textContent = "等待";
+  $("#taskState").className = "task-state";
+  $("#taskPhase").textContent = "等待执行";
+  $("#taskMeta").textContent = `0 / ${rtEmails.length || "—"}`;
+  $("#taskDetail").textContent = "任务正在排队";
+  $("#taskActionRequired").textContent = "";
+  $("#taskActionRequired").classList.add("hidden");
+  $("#taskEvents").innerHTML = "";
+  $("#taskProgress").style.width = "0%";
   $("#taskDownloadBtn").hidden = true;
   $("#taskDownloadBtn").dataset.taskId = "";
   const poll = async () => {
@@ -179,12 +213,23 @@ function watchTask(taskId, label) {
       const task = await api(`api/account-tasks/${taskId}`);
       const pct = task.total ? Math.round(task.completed / task.total * 100) : 100;
       $("#taskProgress").style.width = `${pct}%`;
-      $("#taskMeta").textContent = `${task.message} · ${task.completed}/${task.total}`;
+      $("#taskPhase").textContent = task.phase_label || "处理中";
+      $("#taskMeta").textContent = `${task.completed} / ${task.total}`;
+      $("#taskDetail").textContent = task.phase_detail || task.message || "处理中";
+      $("#taskState").textContent = {
+        queued: "等待", running: "运行中", done: "完成", partial: "部分完成", failed: "失败",
+      }[task.state] || task.state;
+      $("#taskState").className = `task-state ${task.state === "done" ? "ok" : ["failed", "partial"].includes(task.state) ? "bad" : ""}`;
+      const actionBox = $("#taskActionRequired");
+      actionBox.textContent = task.action_required || "";
+      actionBox.classList.toggle("hidden", !task.action_required);
+      renderTaskEvents(task.events);
       if (task.download_ready) {
         $("#taskDownloadBtn").hidden = false;
         $("#taskDownloadBtn").dataset.taskId = taskId;
       }
       if (["done", "partial", "failed"].includes(task.state)) {
+        rtEmails.forEach(email => state.activeRtEmails.delete(email));
         const tone = task.succeeded ? "ok" : "bad";
         setToast(task.message, tone);
         await refresh(false);

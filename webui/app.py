@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from log_safety import install_sensitive_data_filter  # noqa: E402
 from . import account_ops, db, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 
@@ -40,6 +41,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+install_sensitive_data_filter()
 logger = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -358,12 +360,18 @@ def api_account_source(email: str):
 def api_start_acquire_rt(req: AccountEmailsReq):
     if not req.emails:
         raise HTTPException(400, "emails 不能为空")
-    task_id = account_ops.start_rt_login(
-        req.emails,
-        proxy=req.proxy,
-        otp_timeout=req.otp_timeout,
-    )
-    return {"ok": True, "task_id": task_id}
+    try:
+        task_id, reused = account_ops.start_rt_login(
+            req.emails,
+            proxy=req.proxy,
+            otp_timeout=req.otp_timeout,
+        )
+    except account_ops.AccountTaskBusy as exc:
+        raise HTTPException(
+            409,
+            f"部分所选账号正在另一个 RT 任务中，请等待任务 {exc.task_id[:8]} 完成。",
+        ) from exc
+    return {"ok": True, "task_id": task_id, "reused": reused}
 
 
 @app.post("/api/account-management/tasks/refresh-status")

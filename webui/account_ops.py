@@ -14,14 +14,44 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from auth_flow import AuthFlow
+from auth_flow import AuthFlow, SmsRequiredError
 from config import Config
+from log_safety import redact_sensitive_text
 from mail_outlook import OutlookMailProvider
 
 from . import db, exporter
+from .sms_runtime import build_sms_controller
 
 logger = logging.getLogger("webui.account_ops")
 TASK_TTL_SECONDS = 3600
+PHASE_LABELS = {
+    "queued": "等待执行",
+    "prepare": "检查账号资料",
+    "login": "登录已有账号",
+    "email_otp": "邮箱验证码",
+    "web_session": "建立网页会话",
+    "codex_oauth": "Codex 授权",
+    "phone_verification": "手机验证",
+    "persist": "保存 RT",
+    "download": "生成下载文件",
+    "complete": "任务完成",
+    "failed": "任务失败",
+}
+
+
+class AccountOperationError(RuntimeError):
+    """可安全展示且带稳定错误码、处理建议的账号运维错误。"""
+
+    def __init__(self, code: str, message: str, action: str = ""):
+        super().__init__(message)
+        self.code = code
+        self.action = action
+
+
+class AccountTaskBusy(RuntimeError):
+    def __init__(self, task_id: str):
+        super().__init__("所选账号已有 RT 获取任务运行中")
+        self.task_id = task_id
 
 
 @dataclass
@@ -42,6 +72,43 @@ class AccountTask:
     filename: str = ""
     created_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
+    phase: str = "queued"
+    phase_label: str = "等待执行"
+    phase_detail: str = ""
+    action_required: str = ""
+    events: list[dict] = field(default_factory=list)
+    emails: tuple[str, ...] = field(default_factory=tuple, repr=False)
+
+    def set_phase(
+        self,
+        phase: str,
+        detail: str,
+        *,
+        status: str = "running",
+        email: str = "",
+        code: str = "",
+    ) -> None:
+        safe_detail = redact_sensitive_text(detail, max_length=240)
+        self.phase = phase
+        self.phase_label = PHASE_LABELS.get(phase, phase)
+        self.phase_detail = safe_detail
+        event = {
+            "phase": phase,
+            "label": self.phase_label,
+            "detail": safe_detail,
+            "status": status,
+            "email": _clean_email(email),
+            "code": code,
+            "at": time.time(),
+        }
+        if self.events and all(
+            self.events[-1].get(key) == event.get(key)
+            for key in ("phase", "detail", "status", "email", "code")
+        ):
+            return
+        self.events.append(event)
+        if len(self.events) > 40:
+            del self.events[:-40]
 
     def public(self) -> dict:
         return {
@@ -64,10 +131,16 @@ class AccountTask:
             ),
             "created_at": self.created_at,
             "finished_at": self.finished_at,
+            "phase": self.phase,
+            "phase_label": self.phase_label,
+            "phase_detail": self.phase_detail,
+            "action_required": self.action_required,
+            "events": list(self.events),
         }
 
 
 _tasks: dict[str, AccountTask] = {}
+_active_rt_by_email: dict[str, str] = {}
 _lock = threading.Lock()
 
 
@@ -75,19 +148,23 @@ def _clean_email(value: str) -> str:
     return str(value or "").strip().lower()
 
 
+def _error_payload(exc: Exception) -> dict:
+    if isinstance(exc, AccountOperationError):
+        code = exc.code
+        action = exc.action
+    elif isinstance(exc, SmsRequiredError):
+        code = "SMS_VERIFICATION_FAILED"
+        action = "请检查“运行与配置 → 接码配置”中的余额、国家和 API Key 后重试。"
+    else:
+        code = "ACCOUNT_TASK_FAILED"
+        action = ""
+    message = redact_sensitive_text(exc, max_length=180) or exc.__class__.__name__
+    return {"code": code, "message": message, "action": action}
+
+
 def _safe_error(exc: Exception) -> str:
-    """返回可展示错误，避免把 token/API key 跟随上游响应写进日志或任务状态。"""
-    text = str(exc or "").replace("\r", " ").replace("\n", " ").strip()
-    lowered = text.lower()
-    sensitive_markers = (
-        "access_token", "refresh_token", "session_token", "authorization",
-        "api key", "api_key", "bearer ",
-    )
-    if any(marker in lowered for marker in sensitive_markers):
-        return f"{exc.__class__.__name__}（敏感响应已隐藏）"
-    text = re.sub(r"\beyJ[A-Za-z0-9_.-]{24,}\b", "[token hidden]", text)
-    text = re.sub(r"\b[A-Za-z0-9_-]{80,}\b", "[secret hidden]", text)
-    return text[:180] or exc.__class__.__name__
+    """兼容原调用方的安全错误文本。"""
+    return _error_payload(exc)["message"]
 
 
 def _safe_filename_email(email: str) -> str:
@@ -95,16 +172,25 @@ def _safe_filename_email(email: str) -> str:
     return cleaned[:120] or "account"
 
 
-def _new_task(kind: str, total: int) -> AccountTask:
-    task = AccountTask(task_id=uuid.uuid4().hex, kind=kind, total=total)
+def _prune_tasks_locked() -> None:
+    now = time.time()
+    expired = [
+        key for key, item in _tasks.items()
+        if item.finished_at and now - item.finished_at > TASK_TTL_SECONDS
+    ]
+    for key in expired:
+        _tasks.pop(key, None)
+
+
+def _new_task(kind: str, total: int, *, emails: tuple[str, ...] = ()) -> AccountTask:
+    task = AccountTask(
+        task_id=uuid.uuid4().hex,
+        kind=kind,
+        total=total,
+        emails=emails,
+    )
     with _lock:
-        now = time.time()
-        expired = [
-            key for key, item in _tasks.items()
-            if item.finished_at and now - item.finished_at > TASK_TTL_SECONDS
-        ]
-        for key in expired:
-            _tasks.pop(key, None)
+        _prune_tasks_locked()
         _tasks[task.task_id] = task
     return task
 
@@ -140,11 +226,24 @@ def _run_async(task: AccountTask, worker: Callable[[AccountTask], None]) -> str:
         except Exception as exc:
             task.state = "failed"
             task.failed += 1
-            task.message = _safe_error(exc)
+            error = _error_payload(exc)
+            task.message = error["message"]
+            task.action_required = error["action"]
+            task.set_phase(
+                "failed",
+                error["message"],
+                status="error",
+                code=error["code"],
+            )
             logger.warning("账号任务 %s 失败: %s", task.task_id, task.message)
         finally:
             task.current_email = ""
             task.finished_at = time.time()
+            if task.kind == "acquire_rt":
+                with _lock:
+                    for email in task.emails:
+                        if _active_rt_by_email.get(email) == task.task_id:
+                            _active_rt_by_email.pop(email, None)
 
     threading.Thread(
         target=run,
@@ -232,12 +331,29 @@ def start_sub2_export(emails: list[str]) -> tuple[str, int, int]:
     return _run_async(task, worker), len(eligible), task.skipped
 
 
-def _login_existing_for_rt(email: str, *, proxy: str = "", otp_timeout: int = 180) -> dict:
+def _login_existing_for_rt(
+    email: str,
+    *,
+    proxy: str = "",
+    otp_timeout: int = 180,
+    progress: Optional[Callable[..., None]] = None,
+) -> dict:
+    emit = progress or (lambda *_args, **_kwargs: None)
+    emit("prepare", "正在核对号池中的原始邮箱凭据", status="running")
     source = db.get_account(email)
     if not source:
-        raise RuntimeError("号池中没有该账号的原始四段邮箱凭据")
+        raise AccountOperationError(
+            "SOURCE_EMAIL_NOT_FOUND",
+            "号池中没有该账号的原始四段邮箱凭据。",
+            "请先把该账号的 Outlook 四段邮箱重新导入号池。",
+        )
     if not source.get("client_id") or not source.get("refresh_token"):
-        raise RuntimeError("原始 Outlook 四段凭据不完整")
+        raise AccountOperationError(
+            "SOURCE_EMAIL_INCOMPLETE",
+            "原始 Outlook 四段凭据不完整。",
+            "请补全 email、password、client_id、refresh_token 后重试。",
+        )
+    emit("prepare", "原始邮箱凭据检查通过", status="success")
 
     cfg = Config(proxy=proxy.strip() or None)
     mail = OutlookMailProvider(
@@ -246,38 +362,114 @@ def _login_existing_for_rt(email: str, *, proxy: str = "", otp_timeout: int = 18
         client_id=source["client_id"],
         refresh_token=source["refresh_token"],
     )
-    flow = AuthFlow(cfg)
+    sms_cfg = db.get_sms_internal_config()
+
+    def sms_log(message: str) -> None:
+        emit("phone_verification", message, status="running")
+
+    sms_callback = build_sms_controller(
+        sms_cfg,
+        log_fn=sms_log,
+        require_complete=True,
+    )
+    flow = AuthFlow(
+        cfg,
+        sms_callback=sms_callback,
+        # RT 是用户主动操作；启用接码后若绑号失败，应明确失败而非静默回退。
+        sms_required=bool(sms_cfg.get("sms_enabled")),
+    )
     # OTP 超时由邮件 provider 从环境读取；仅在当前任务线程内临时设置会污染多线程，
     # 因此显式包一层 provider 方法，向底层传入本任务的超时值。
     original_wait = mail.wait_for_otp
 
     def wait_for_otp(target_email, timeout=240, issued_after=None):
-        return original_wait(
+        emit("email_otp", "已发出验证码，正在从 Outlook 邮箱读取", status="running")
+        code = original_wait(
             target_email,
             timeout=max(30, min(int(otp_timeout), 600)),
             issued_after=issued_after,
         )
+        emit("email_otp", "邮箱验证码读取成功", status="success")
+        return code
 
     mail.wait_for_otp = wait_for_otp
     try:
-        result = flow.run_protocol_login(
-            mail,
-            email,
-            password=source.get("password", ""),
-            allow_registration_fallback=False,
-        )
+        emit("login", "正在以已有账号模式登录；禁止回落注册", status="running")
+        try:
+            result = flow.run_protocol_login(
+                mail,
+                email,
+                password=source.get("password", ""),
+                allow_registration_fallback=False,
+            )
+        except SmsRequiredError as exc:
+            emit(
+                "phone_verification",
+                "Codex 要求手机验证，但接码流程未完成",
+                status="error",
+                code="SMS_VERIFICATION_FAILED",
+            )
+            raise AccountOperationError(
+                "SMS_VERIFICATION_FAILED",
+                f"手机验证未完成：{redact_sensitive_text(exc, max_length=120)}",
+                "请检查“运行与配置 → 接码配置”中的余额、国家和 API Key 后重试。",
+            ) from exc
         data = result.to_dict()
+        if data.get("access_token") or data.get("session_token"):
+            emit("web_session", "邮箱验证完成，网页会话已建立", status="success")
         rt = str(data.get("refresh_token") or "").strip()
         if not rt:
-            raise RuntimeError("OTP 登录完成，但未获取到 OpenAI refresh_token")
+            code = str(getattr(flow, "codex_rt_error_code", "") or "")
+            if code == "PHONE_BINDING_REQUIRED":
+                enabled = bool(sms_cfg.get("sms_enabled"))
+                action = (
+                    "接码已启用但未完成绑号，请检查余额、国家和号码库存后重试。"
+                    if enabled else
+                    "请前往“运行与配置 → 接码配置”启用接码后重试；启用会产生接码费用。"
+                )
+                message = "邮箱 OTP 和网页登录均成功，但 Codex 授权要求绑定手机号，RT 未写入。"
+                emit(
+                    "codex_oauth",
+                    message,
+                    status="error",
+                    code=code,
+                )
+                raise AccountOperationError(
+                    code,
+                    message,
+                    action,
+                )
+            detail = str(
+                getattr(flow, "codex_rt_error_message", "")
+                or "Codex OAuth 未返回 RT"
+            )
+            message = f"邮箱 OTP 登录成功，但未获取到 OpenAI RT：{detail}。"
+            emit(
+                "codex_oauth",
+                message,
+                status="error",
+                code=code or "RT_NOT_ISSUED",
+            )
+            raise AccountOperationError(
+                code or "RT_NOT_ISSUED",
+                message,
+                "请稍后重试；若持续失败，请查看任务阶段中的 Codex 授权结果。",
+            )
+        emit("codex_oauth", "Codex OAuth 已返回 RT", status="success")
         # 只更新 RT 及其配套 id_token；不允许临时/不同用途的 AT 覆盖网页 AT。
         db.update_registered_fields(
             email,
             refresh_token=rt,
             id_token=data.get("id_token") or None,
         )
+        emit("persist", "RT 已安全写入账号缓存，网页 AT 保持不变", status="success")
         return db.get_registered(email) or {**data, "email": email}
     finally:
+        if sms_callback is not None:
+            try:
+                sms_callback.cleanup()
+            except Exception:
+                pass
         try:
             flow.session.close()
         except Exception:
@@ -289,23 +481,69 @@ def start_rt_login(
     *,
     proxy: str = "",
     otp_timeout: int = 180,
-) -> str:
+) -> tuple[str, bool]:
     requested = list(dict.fromkeys(_clean_email(e) for e in emails if _clean_email(e)))
-    task = _new_task("acquire_rt", len(requested))
+    if not requested:
+        raise ValueError("emails 不能为空")
+    with _lock:
+        _prune_tasks_locked()
+        active_ids = {
+            _active_rt_by_email[email]
+            for email in requested
+            if email in _active_rt_by_email
+        }
+        if active_ids:
+            task_id = next(iter(active_ids))
+            if len(active_ids) == 1 and all(
+                _active_rt_by_email.get(email) == task_id for email in requested
+            ):
+                return task_id, True
+            raise AccountTaskBusy(task_id)
+        task = AccountTask(
+            task_id=uuid.uuid4().hex,
+            kind="acquire_rt",
+            total=len(requested),
+            emails=tuple(requested),
+        )
+        _tasks[task.task_id] = task
+        for email in requested:
+            _active_rt_by_email[email] = task.task_id
 
     def worker(state: AccountTask) -> None:
         successful: list[dict] = []
         for email in requested:
             state.current_email = email
-            state.message = f"等待 OTP 登录 {state.completed + 1}/{state.total}"
+            state.message = f"正在处理 {state.completed + 1}/{state.total}"
+
+            def progress(phase, detail, *, status="running", code=""):
+                state.set_phase(
+                    phase,
+                    detail,
+                    status=status,
+                    email=email,
+                    code=code,
+                )
+
             try:
                 cred = _login_existing_for_rt(
-                    email, proxy=proxy, otp_timeout=otp_timeout,
+                    email,
+                    proxy=proxy,
+                    otp_timeout=otp_timeout,
+                    progress=progress,
                 )
                 state.succeeded += 1
-                state.results[email] = {"status": "ok", "label": "RT 获取成功"}
+                state.results[email] = {
+                    "status": "ok",
+                    "code": "RT_ACQUIRED",
+                    "label": "RT 获取并保存成功",
+                }
                 # 文件生成是附加动作；即使刷新 Codex AT 失败，也不能把已成功的
                 # OTP 取 RT 误报成失败。
+                state.set_phase(
+                    "download",
+                    "正在刷新临时 Codex AT 并生成 Sub2API JSON",
+                    email=email,
+                )
                 try:
                     fresh = exporter.refresh_codex_token(cred["refresh_token"])
                     rolled_rt = str(fresh.get("refresh_token") or "").strip()
@@ -313,13 +551,46 @@ def start_rt_login(
                         db.update_registered_fields(email, refresh_token=rolled_rt)
                         cred["refresh_token"] = rolled_rt
                     successful.append(_sub2_account(cred, fresh))
+                    state.set_phase(
+                        "download",
+                        "Sub2API JSON 已生成，等待下载",
+                        status="success",
+                        email=email,
+                    )
                 except Exception as export_exc:
-                    state.results[email]["download_error"] = _safe_error(export_exc)
+                    export_error = _error_payload(export_exc)
+                    state.results[email]["download_error"] = export_error["message"]
+                    state.set_phase(
+                        "download",
+                        f"RT 已保存，但文件生成失败：{export_error['message']}",
+                        status="warning",
+                        email=email,
+                        code="DOWNLOAD_BUILD_FAILED",
+                    )
             except Exception as exc:
                 state.failed += 1
-                error = _safe_error(exc)
-                state.errors.append({"email": email, "error": error})
-                state.results[email] = {"status": "error", "label": error}
+                error = _error_payload(exc)
+                state.errors.append({
+                    "email": email,
+                    "error": error["message"],
+                    "code": error["code"],
+                    "action": error["action"],
+                })
+                state.results[email] = {
+                    "status": "error",
+                    "code": error["code"],
+                    "label": error["message"],
+                    "action": error["action"],
+                }
+                if error["action"] and not state.action_required:
+                    state.action_required = error["action"]
+                state.set_phase(
+                    "failed",
+                    error["message"],
+                    status="error",
+                    email=email,
+                    code=error["code"],
+                )
             finally:
                 state.completed += 1
         if successful:
@@ -330,8 +601,14 @@ def start_rt_login(
                 else f"sub2_{_safe_filename_email(successful[0]['name'])}_{stamp}.json"
             )
         state.message = f"RT 获取成功 {state.succeeded} 个，失败 {state.failed} 个"
+        state.set_phase(
+            "complete" if state.failed == 0 else "failed",
+            state.message,
+            status="success" if state.failed == 0 else "error",
+            code="" if state.failed == 0 else "RT_TASK_PARTIAL_OR_FAILED",
+        )
 
-    return _run_async(task, worker)
+    return _run_async(task, worker), False
 
 
 def _request_account_status(access_token: str, proxy: str = "") -> tuple[int, dict]:

@@ -24,9 +24,10 @@ sys.path.insert(0, str(ROOT))
 from config import Config  # noqa: E402
 from mail_outlook import OutlookMailProvider  # noqa: E402
 from auth_flow import AuthFlow, SignupInvalidStateError, SmsRequiredError  # noqa: E402
-from sms_provider import PhoneCallbackController  # noqa: E402
+from log_safety import redact_sensitive_text  # noqa: E402
 
 from . import db  # noqa: E402
+from .sms_runtime import build_sms_controller  # noqa: E402
 
 # 每个 run 保留历史事件，并为每个 SSE 客户端分配独立队列。
 # 这样晚连接、浏览器重连和多客户端查看都不会消费彼此的日志。
@@ -68,7 +69,7 @@ class QueueLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord):
         try:
-            msg = self.format(record)
+            msg = redact_sensitive_text(self.format(record))
             self._fh.write(msg + "\n")
             self._fh.flush()
             _publish_run_event(self.run_id, msg)
@@ -524,22 +525,13 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
 def _build_sms_callback(
     run_id: str,
     cfg: Optional[dict] = None,
-) -> Optional[PhoneCallbackController]:
+) -> Optional[object]:
     """根据 webui 配置创建 SMS 接码 controller。
 
     未启用接码或未配置 API key 时返回 None，flow 会回退到环境变量路径。
     log_fn 把租号/等码的状态推到 SSE 流，前端可见。
     """
     cfg = cfg or db.get_sms_internal_config()
-    if not cfg.get("sms_enabled"):
-        return None
-    api_key = (cfg.get("sms_api_key") or "").strip()
-    if not api_key:
-        if cfg.get("sms_proactive"):
-            raise SmsRequiredError("主动接码已开启，但未配置 SMS API Key")
-        logging.getLogger("registrar").warning("[sms] 已启用接码但未配置 sms_api_key，跳过")
-        return None
-
     smslog = logging.getLogger("registrar")
 
     def _log(msg: str) -> None:
@@ -550,20 +542,7 @@ def _build_sms_callback(
         except Exception:
             pass
 
-    try:
-        return PhoneCallbackController(
-            provider_key=cfg["sms_provider"],
-            config=cfg,
-            service=cfg.get("sms_service") or "openai",
-            country=cfg.get("sms_country") or "52",
-            log_fn=_log,
-            auto_select_country=bool(cfg.get("sms_auto_country")),
-        )
-    except Exception as e:
-        if cfg.get("sms_proactive"):
-            raise SmsRequiredError(f"主动接码 controller 创建失败: {e}") from e
-        smslog.warning(f"[sms] 创建接码 controller 失败: {e}")
-        return None
+    return build_sms_controller(cfg, log_fn=_log)
 
 
 def start_registration(account: dict, options: dict) -> str:
