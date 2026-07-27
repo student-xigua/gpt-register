@@ -42,6 +42,9 @@ KAKAO_IP_CHECK_SOURCES = (
     ("ipapi", "https://ipapi.co/json/"),
     ("ipwho", "https://ipwho.is/"),
     ("myip", "https://api.myip.com/"),
+    # 少数 SOCKS5 线路与上述 HTTPS 检测站的 TLS 协商不兼容；HTTP 兜底仍只
+    # 接受明确的 countryCode，不能绕过地区校验。
+    ("ip_api_http", "http://ip-api.com/json"),
 )
 KAKAO_PROVIDER_DOMAINS = (
     "kakao.com",
@@ -402,6 +405,8 @@ def _ip_country(source: str, payload: dict) -> str:
         return str(payload.get("country_code") or payload.get("country") or "").upper()
     if source == "ipwho":
         return str(payload.get("country_code") or "").upper() if payload.get("success") is not False else ""
+    if source == "ip_api_http":
+        return str(payload.get("countryCode") or "").upper() if payload.get("status") == "success" else ""
     return str(payload.get("cc") or payload.get("country") or "").upper()
 
 

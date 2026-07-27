@@ -358,6 +358,10 @@ class KakaoProxyPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "出口国家 US，要求 KR"):
             link_gen._preflight_kakao_proxy(self.IpCffi("US"), "http://proxy:8000", "KR", "checkout")
 
+    def test_http_fallback_reads_country_code_only_from_success_payload(self):
+        self.assertEqual(link_gen._ip_country("ip_api_http", {"status": "success", "countryCode": "KR"}), "KR")
+        self.assertEqual(link_gen._ip_country("ip_api_http", {"status": "fail", "countryCode": "KR"}), "")
+
 
 class KakaoRedirectSafetyTests(unittest.TestCase):
     class RedirectSession:
