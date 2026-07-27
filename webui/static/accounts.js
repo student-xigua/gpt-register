@@ -85,16 +85,17 @@ function linkButton(row, method) {
 function renderRows() {
   const body = $("#accountsTable tbody");
   if (!state.rows.length) {
-    body.innerHTML = `<tr><td class="empty" colspan="9"><i data-lucide="database-zap"></i> 当前筛选下暂无账号</td></tr>`;
+    body.innerHTML = `<tr><td class="empty" colspan="10"><i data-lucide="database-zap"></i> 当前筛选下暂无账号</td></tr>`;
     initIcons();
     return;
   }
-  body.innerHTML = state.rows.map(row => {
+  body.innerHTML = state.rows.map((row, index) => {
     const checkedAt = row.plus_check?.checked_at;
     const twoFaBusy = state.active2faEmails.has(row.email);
     const twoFaBound = row.totp_len > 0;
     return `<tr>
       <td class="check-cell"><input class="row-check" type="checkbox" data-email="${escapeHtml(row.email)}" ${state.selected.has(row.email) ? "checked" : ""}></td>
+      <td class="index-cell">${(state.page - 1) * state.pageSize + index + 1}</td>
       <td><span class="truncate email" title="${escapeHtml(row.email)}">${escapeHtml(row.email)}</span><span class="subline">录入 ${fmtTime(row.created_at)}</span></td>
       <td>${plusBadge(row.plus_check)}</td>
       <td>${usedBadge(row)}</td>
@@ -380,6 +381,16 @@ $("#filterSegment").addEventListener("click", event => {
   if (!button) return;
   state.filter = button.dataset.filter;
   $("#filterSegment").querySelectorAll("button").forEach(item => item.classList.toggle("active", item === button));
+  $("#plusFilter").value = "plus";
+  $("#plusFilterWrap").classList.remove("active");
+  state.selected.clear();
+  refresh(true);
+});
+
+$("#plusFilter").addEventListener("change", event => {
+  state.filter = event.target.value;
+  $("#filterSegment").querySelectorAll("button").forEach(item => item.classList.remove("active"));
+  $("#plusFilterWrap").classList.add("active");
   state.selected.clear();
   refresh(true);
 });

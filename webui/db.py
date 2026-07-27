@@ -526,8 +526,12 @@ _FILTER_WHERE = {
     "has_rt": ("WHERE length(refresh_token) > 0", ()),
     "no_rt": ("WHERE coalesce(length(refresh_token),0) = 0", ()),
     "plus": (f"WHERE plan_status IN ({_PLUS_IN})", PLUS_STATUSES),
-    "used": ("WHERE used_at IS NOT NULL", ()),
-    "unused": ("WHERE used_at IS NULL", ()),
+    # 使用标记只对 Plus / 优惠 / 试用账号有意义；Free 账号不参与这两个筛选。
+    "plus_used": (f"WHERE plan_status IN ({_PLUS_IN}) AND used_at IS NOT NULL", PLUS_STATUSES),
+    "plus_unused": (f"WHERE plan_status IN ({_PLUS_IN}) AND used_at IS NULL", PLUS_STATUSES),
+    # 兼容仍在缓存中的旧前端筛选值。
+    "used": (f"WHERE plan_status IN ({_PLUS_IN}) AND used_at IS NOT NULL", PLUS_STATUSES),
+    "unused": (f"WHERE plan_status IN ({_PLUS_IN}) AND used_at IS NULL", PLUS_STATUSES),
 }
 
 
@@ -558,14 +562,14 @@ def registered_summary() -> dict:
         status = row["plan_status"] or None
         if status in PLUS_STATUSES:
             summary["plus"] += 1
+            if row["used_at"]:
+                summary["used"] += 1
+            else:
+                summary["unused"] += 1
         elif status == "free":
             summary["free"] += 1
         elif status in ("banned", "credential_invalid", "error"):
             summary["issues"] += 1
-        if row["used_at"]:
-            summary["used"] += 1
-        else:
-            summary["unused"] += 1
     return summary
 
 

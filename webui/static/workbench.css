@@ -133,6 +133,10 @@ button svg { width: 14px; height: 14px; }
 .segment { display: inline-flex; height: 30px; padding: 2px; gap: 2px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-muted); }
 .segment button { height: 24px; padding: 0 9px; border: 0; background: transparent; font-size: 11px; }
 .segment button.active { color: var(--blue); background: #fff; box-shadow: 0 1px 4px rgba(23,32,29,.1); }
+.plus-filter { display: flex; align-items: center; height: 24px; border-radius: 4px; }
+.plus-filter.active { background: #fff; box-shadow: 0 1px 4px rgba(23,32,29,.1); }
+.plus-filter select { height: 24px; padding: 0 19px 0 8px; border: 0; border-radius: 4px; color: var(--ink); background: transparent; font: inherit; font-size: 11px; font-weight: 650; cursor: pointer; outline: none; }
+.plus-filter.active select { color: var(--blue); }
 .selection-note { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .selection-note b { color: var(--blue); }
 
@@ -157,6 +161,7 @@ td { height: 40px; padding: 4px 8px; border-bottom: 1px solid #e7ebe9; vertical-
 tbody tr:nth-child(even) td { background: #f9fbfa; }
 tbody tr:hover td { background: #eef4f0; }
 .check-cell { width: 35px; text-align: center; }
+.index-cell { width: 42px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }
 input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--blue); }
 .truncate { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .email { font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; }

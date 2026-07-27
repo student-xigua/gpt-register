@@ -44,11 +44,15 @@
     <section class="toolbar" aria-label="账号工具栏">
       <div class="segment" id="filterSegment">
         <button class="active" data-filter="all">全部</button>
-        <button data-filter="plus" title="Plus / 优惠 / 试用">Plus</button>
+        <label class="plus-filter" id="plusFilterWrap" title="仅筛选 Plus / 优惠 / 试用账号">
+          <select id="plusFilter" aria-label="Plus 使用状态筛选">
+            <option value="plus">Plus</option>
+            <option value="plus_used">Plus · 已使用</option>
+            <option value="plus_unused">Plus · 未使用</option>
+          </select>
+        </label>
         <button data-filter="has_rt">有 RT</button>
         <button data-filter="no_rt">无 RT</button>
-        <button data-filter="used" title="导出过文件 / 复制过 AT 或邮箱">已使用</button>
-        <button data-filter="unused">未使用</button>
       </div>
       <button id="refreshBtn" title="刷新列表"><i data-lucide="refresh-cw"></i>刷新</button>
       <span class="selection-note">已选 <b id="selectedCount">0</b></span>
@@ -67,13 +71,14 @@
       <div class="table-scroll" id="tableScroll">
         <table id="accountsTable">
           <colgroup>
-            <col style="width:35px"><col style="width:17%"><col style="width:9%">
+            <col style="width:35px"><col style="width:42px"><col style="width:17%"><col style="width:9%">
             <col style="width:8%"><col style="width:6%"><col style="width:6%"><col style="width:6%">
             <col style="width:10%"><col>
           </colgroup>
           <thead>
             <tr>
               <th class="check-cell"><input id="selectAll" type="checkbox" aria-label="全选当前页"></th>
+              <th class="index-cell">序号</th>
               <th>账号邮箱</th>
               <th>套餐状态</th>
               <th>使用状态</th>
@@ -136,6 +141,6 @@
 <div class="toast" id="toast"></div>
 <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
 <script src="static/workbench-common.js"></script>
-<script src="static/accounts.js?v=20260727-3"></script>
+<script src="static/accounts.js?v=20260727-4"></script>
 </body>
 </html>
