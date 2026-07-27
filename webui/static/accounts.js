@@ -89,7 +89,6 @@ function renderRows() {
   }
   body.innerHTML = state.rows.map(row => {
     const checkedAt = row.plus_check?.checked_at;
-    const rtBusy = state.activeRtEmails.has(row.email);
     const twoFaBusy = state.active2faEmails.has(row.email);
     const twoFaBound = row.totp_len > 0;
     return `<tr>
@@ -105,7 +104,6 @@ function renderRows() {
         <button class="icon-action" data-action="view" data-email="${escapeHtml(row.email)}" title="查看凭证"><i data-lucide="eye"></i></button>
         <button class="icon-action" data-action="email" data-email="${escapeHtml(row.email)}" title="获取原始邮箱四段"><i data-lucide="mail"></i></button>
         <button class="text-action" data-action="status" data-email="${escapeHtml(row.email)}" title="实时刷新账号状态">状态</button>
-        <button class="text-action" data-action="acquire-rt" data-email="${escapeHtml(row.email)}" title="${rtBusy ? "RT 获取任务进行中" : "重新 OTP 登录获取 RT"}" ${rtBusy ? "disabled" : ""}>${rtBusy ? "处理中" : "取 RT"}</button>
         <button class="text-action${twoFaBound ? " bound" : ""}" data-action="${twoFaBound ? "copy-2fa" : "bind-2fa"}" data-email="${escapeHtml(row.email)}" title="${twoFaBusy ? "2FA 绑定任务进行中" : twoFaBound ? "复制 账号----密码----2FA 密钥" : "邮箱重认证后绑定 2FA"}" ${twoFaBusy ? "disabled" : ""}>${twoFaBusy ? "处理中" : twoFaBound ? "2FA" : "绑 2FA"}</button>
         ${linkButton(row, "upi")}
         ${linkButton(row, "kakao")}

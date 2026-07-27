@@ -5,10 +5,12 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import random
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -25,6 +27,9 @@ from .sms_runtime import build_sms_controller
 
 logger = logging.getLogger("webui.account_ops")
 TASK_TTL_SECONDS = 3600
+KAKAO_MAX_FULL_ATTEMPTS = 3
+KAKAO_ACCOUNT_WORKERS = 5
+KAKAO_PROXY_SID_PLACEHOLDER = "{sid}"
 PHASE_LABELS = {
     "queued": "等待执行",
     "prepare": "检查账号资料",
@@ -41,6 +46,8 @@ PHASE_LABELS = {
     "checkout": "创建 checkout",
     "stripe_init": "初始化 Stripe",
     "update": "应用促销价",
+    "attempt": "开始新 checkout",
+    "retry": "更换线路重试",
     "confirm": "确认付款方式",
     "approve": "审批并提取链接",
     "complete": "任务完成",
@@ -180,6 +187,34 @@ def _error_payload(exc: Exception) -> dict:
 def _safe_error(exc: Exception) -> str:
     """兼容原调用方的安全错误文本。"""
     return _error_payload(exc)["message"]
+
+
+def _is_retryable_kakao_error(exc: Exception) -> bool:
+    """判断 Kakao 提链是否应换线路重建 checkout。"""
+    detail = str(exc or "").lower()
+    fatal_markers = (
+        "checkout_not_kakao_trial",
+        "促销未生效",
+        "没有可用的网页 access token",
+        "http 400",
+        "http 401",
+        "http 403",
+    )
+    if any(marker in detail for marker in fatal_markers):
+        return False
+    retryable_markers = (
+        "timeout",
+        "timed out",
+        "curl: (",
+        "代理",
+        "proxy",
+        "connection",
+        "network",
+        "http 408",
+        "http 429",
+        "http 5",
+    )
+    return any(marker in detail for marker in retryable_markers)
 
 
 def _safe_filename_email(email: str) -> str:
@@ -393,6 +428,30 @@ def _pick_proxy(pool_text: str) -> str:
     return random.choice(lines) if lines else ""
 
 
+def _new_kakao_proxy_sid() -> str:
+    """生成 8 位 sticky session ID，用于让每个新 checkout 更换出口 IP。"""
+    return secrets.token_hex(4)
+
+
+def _materialize_proxy_template(proxy: str, sid: str) -> str:
+    """将代理中的 ``{sid}`` 占位符物化；普通代理保持不变。"""
+    text = str(proxy or "").strip()
+    return text.replace(KAKAO_PROXY_SID_PLACEHOLDER, sid) if sid else text
+
+
+def _kakao_checkout_templates(pool1_lines: list[str], attempt_count: int) -> list[str]:
+    """为 Kakao 完整重建选择模板。
+
+    固定代理最多只试池中不同线路；若任一 Kakao 池含 ``{sid}`` sticky 模板，
+    则可以在同一条模板上生成 3 个不同会话，每次都对应全新 checkout。
+    """
+    templates = [line for line in pool1_lines if line]
+    if not templates:
+        return []
+    shuffled = random.sample(templates, k=len(templates))
+    return [shuffled[index % len(shuffled)] for index in range(max(1, int(attempt_count)))]
+
+
 def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) -> str:
     """后台为账号提炼 UPI / Kakao 付款链接，成功后写入 extra_json.links。"""
     method = (method or "").strip().lower()
@@ -406,7 +465,9 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
     pools = db.get_proxy_pools()
     pool1 = pools.get(f"{method}_pool1", "")
     pool2 = pools.get(f"{method}_pool2", "")
-    if not _pick_proxy(pool1):
+    pool1_lines = _pool_lines(pool1)
+    pool2_lines = _pool_lines(pool2)
+    if not pool1_lines:
         raise AccountOperationError(
             "PROXY_POOL_EMPTY",
             f"{label} 代理池1 为空，无法提炼链接。",
@@ -416,12 +477,18 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
     task = _new_task("gen_link", len(requested))
 
     def worker(state: AccountTask) -> None:
-        for email in requested:
-            state.current_email = email
-            state.message = f"正在提炼 {state.completed + 1}/{state.total}"
+        # get_task() 使用同一把锁生成公开快照，避免并行账号更新
+        # results/events 时前端刚好复制到变动中的 dict/list。
+        state_lock = _lock
+
+        def process_email(email: str) -> None:
+            with state_lock:
+                state.current_email = email
+                state.message = f"正在提炼 {state.completed + 1}/{state.total}"
 
             def progress(phase, detail, *, status="running", code=""):
-                state.set_phase(phase, detail, status=status, email=email, code=code)
+                with state_lock:
+                    state.set_phase(phase, detail, status=status, email=email, code=code)
 
             try:
                 cred = db.get_registered(email)
@@ -431,21 +498,82 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                         "账号不在已注册列表里。",
                         "请先完成注册或导入该账号的凭证后重试。",
                     )
-                checkout_proxy = _pick_proxy(pool1)
-                update_proxy = _pick_proxy(pool2) or checkout_proxy
-                result = link_gen.generate_link(
-                    str(cred.get("access_token") or ""),
-                    method,
-                    checkout_proxy=checkout_proxy,
-                    update_proxy=update_proxy,
-                    checkout_pool=_pool_lines(pool1),
-                    poll_seconds=poll_seconds,
-                    log=progress,
-                )
-                link = str(result.get("link") or "").strip()
+                if method == "kakao":
+                    has_sid_template = any(
+                        KAKAO_PROXY_SID_PLACEHOLDER in line
+                        for line in (*pool1_lines, *pool2_lines)
+                    )
+                    attempt_count = (
+                        KAKAO_MAX_FULL_ATTEMPTS
+                        if has_sid_template
+                        else min(KAKAO_MAX_FULL_ATTEMPTS, len(pool1_lines))
+                    )
+                    checkout_candidates = _kakao_checkout_templates(pool1_lines, attempt_count)
+                else:
+                    attempt_count = 1
+                    checkout_candidates = [random.choice(pool1_lines)]
+
+                result: dict = {}
+                link = ""
+                for attempt_index, checkout_template in enumerate(checkout_candidates, start=1):
+                    attempt_sid = _new_kakao_proxy_sid() if method == "kakao" else ""
+                    checkout_proxy = _materialize_proxy_template(checkout_template, attempt_sid)
+                    update_template = random.choice(pool2_lines) if pool2_lines else checkout_template
+                    update_proxy = _materialize_proxy_template(update_template, attempt_sid)
+                    if method == "kakao":
+                        progress(
+                            "attempt",
+                            f"Kakao 第 {attempt_index}/{attempt_count} 次：固定单一 KR 线路创建新 checkout",
+                            status="running",
+                            code="KAKAO_NEW_CHECKOUT",
+                        )
+                    try:
+                        result = link_gen.generate_link(
+                            str(cred.get("access_token") or ""),
+                            method,
+                            checkout_proxy=checkout_proxy,
+                            update_proxy=update_proxy,
+                            checkout_pool=[checkout_proxy] if method == "kakao" else pool1_lines,
+                            poll_seconds=poll_seconds,
+                            approve_workers=1 if method == "kakao" else 10,
+                            log=progress,
+                        )
+                    except Exception as exc:
+                        if (
+                            method == "kakao"
+                            and attempt_index < attempt_count
+                            and _is_retryable_kakao_error(exc)
+                        ):
+                            progress(
+                                "retry",
+                                f"本次线路异常（{type(exc).__name__}），更换 KR 线路重新开始",
+                                status="warning",
+                                code="KAKAO_RETRY_NETWORK",
+                            )
+                            continue
+                        raise
+                    link = str(result.get("link") or "").strip()
+                    if link or method != "kakao" or attempt_index >= attempt_count:
+                        break
+                    if method == "kakao" and result.get("retryable") is False:
+                        break
+                    approve_states = list(result.get("approve_states") or [])
+                    retry_reason = str(result.get("retry_reason") or "redirect_not_ready")
+                    progress(
+                        "retry",
+                        f"本次未拿到链接（{retry_reason}，审批={approve_states or ['none']}），更换 KR 线路重新开始",
+                        status="warning",
+                        code="KAKAO_RETRY_NEW_CHECKOUT",
+                    )
                 if not link:
                     states = result.get("approve_states") or []
-                    if states and all(s == "blocked" for s in states):
+                    retry_reason = str(result.get("retry_reason") or "")
+                    if method == "kakao" and result.get("retryable") is False:
+                        hint = (
+                            f"当前 checkout 返回不可重试状态（{retry_reason or 'unknown'}），"
+                            "请刷新账号状态/网页 AT 后再试。"
+                        )
+                    elif states and all(s == "blocked" for s in states):
                         hint = "OpenAI 风控 block 了所有 approve 出口，换一批住宅代理节点或稍后重试。"
                     elif states and all(s in ("timeout", "error") for s in states):
                         hint = "approve 出口全部超时/异常，代理节点不通，换一批节点重试。"
@@ -457,30 +585,48 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                         hint,
                     )
                 db.update_registered_link(email, method, link)
-                state.succeeded += 1
-                state.results[email] = {
-                    "status": "ok",
-                    "code": "LINK_OK",
-                    "label": f"{label} 链接已生成",
-                    "link": link,
-                }
+                with state_lock:
+                    state.succeeded += 1
+                    state.results[email] = {
+                        "status": "ok",
+                        "code": "LINK_OK",
+                        "label": f"{label} 链接已生成",
+                        "link": link,
+                    }
                 progress("complete", f"{label} 链接已生成", status="success")
             except Exception as exc:
-                state.failed += 1
                 error = _error_payload(exc)
-                state.errors.append({"email": email, **error})
-                state.results[email] = {"status": "error", **error}
-                if error["action"] and not state.action_required:
-                    state.action_required = error["action"]
-                state.set_phase(
-                    "failed", error["message"], status="error",
-                    email=email, code=error["code"],
-                )
+                with state_lock:
+                    state.failed += 1
+                    state.errors.append({"email": email, **error})
+                    state.results[email] = {"status": "error", **error}
+                    if error["action"] and not state.action_required:
+                        state.action_required = error["action"]
+                    state.set_phase(
+                        "failed", error["message"], status="error",
+                        email=email, code=error["code"],
+                    )
             finally:
-                state.completed += 1
-        state.message = (
-            f"{label} 链接生成成功 {state.succeeded} 个，失败 {state.failed} 个"
-        )
+                with state_lock:
+                    state.completed += 1
+
+        if method == "kakao" and len(requested) > 1:
+            max_workers = min(KAKAO_ACCOUNT_WORKERS, len(requested))
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="kakao-link",
+            ) as executor:
+                futures = [executor.submit(process_email, email) for email in requested]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+        else:
+            for email in requested:
+                process_email(email)
+
+        with state_lock:
+            state.message = (
+                f"{label} 链接生成成功 {state.succeeded} 个，失败 {state.failed} 个"
+            )
 
     return _run_async(task, worker)
 

@@ -76,8 +76,9 @@ METHODS: dict[str, dict] = {
         # Kakao 只接受促销生效后的 0 KRW checkout，并用同一 sticky Seed 派生地区。
         "require_zero": True,
         "promotion_country": "VN",
+        "promotion_countries": ("JP", "VN"),
         "provider_country": "KR",
-        "min_poll_seconds": 120,
+        "poll_seconds": 60,
         "link_match": "",
     },
 }
@@ -146,6 +147,17 @@ def _force_region(proxy: str, region: str) -> str:
     return text
 
 
+def _proxy_country_hint(proxy: str) -> str:
+    """从代理用户名中读取 country/region 选择器，没有则返回空。
+
+    这只用于决定 Kakao 促销池的预检国家；密码、主机和其他用户名字段不会被写入日志。
+    """
+    match = PROXY_COUNTRY_SELECTOR_RE.search(str(proxy or ""))
+    if not match:
+        return ""
+    return str(match.group("value") or "").split(",", 1)[0].upper()
+
+
 def _approve_exits(pool: Optional[list[str]], fallback: str, region: str, n: int) -> list[str]:
     """为 approve 挑 n 个「不同预置节点」的出口，全部强制成 channel 国家（IN/KR）。
 
@@ -173,10 +185,13 @@ def _normalize_proxy(raw: str) -> str:
 
 
 def _kakao_proxy_chain(checkout_proxy: str, update_proxy: str) -> tuple[str, str]:
-    """固定 pool1=KR checkout/provider、pool2=VN promotion 的职责。"""
+    """固定 pool1=KR checkout/provider；促销池允许配置的 JP 或 VN 出口。"""
     checkout = _force_region(checkout_proxy, METHODS["kakao"]["provider_country"])
     promotion_seed = update_proxy or checkout_proxy
-    promotion = _force_region(promotion_seed, METHODS["kakao"]["promotion_country"])
+    allowed = tuple(METHODS["kakao"].get("promotion_countries") or ())
+    hinted = _proxy_country_hint(promotion_seed)
+    promotion_country = hinted if hinted in allowed else METHODS["kakao"]["promotion_country"]
+    promotion = _force_region(promotion_seed, promotion_country)
     return checkout, promotion
 
 
@@ -402,7 +417,7 @@ def _preflight_kakao_proxy(cffi, proxy: str, expected_country: str, label: str) 
                     url,
                     headers={"Accept": "application/json", "User-Agent": UA},
                     proxies=_proxy_dict(proxy),
-                    timeout=12,
+                    timeout=8,
                 )
                 if not (200 <= response.status_code < 300):
                     failures.append(f"{source}=HTTP {response.status_code}")
@@ -534,7 +549,7 @@ def generate_link(
     """跑一遍提链流程，返回 {"ok", "link", "amount", "approve_states", ...}。
 
     UPI：IN checkout → BR promotion → IN confirm/approve/poll。
-    Kakao：pool1 KR checkout/provider → pool2 VN promotion → pool1 KR
+    Kakao：pool1 KR checkout/provider → pool2 JP/VN promotion → pool1 KR
     taxes/pre_confirm/confirm/approve/poll → Kakao/Nicepay 最终跳转。
 
     checkout_proxy 走账单国出口（IN/KR），update_proxy 走压价出口（BR）。
@@ -551,19 +566,27 @@ def generate_link(
         raise RuntimeError("该账号没有可用的网页 access token，请先『取 RT / 刷新状态』")
     emit = log or (lambda *a, **k: None)
 
-    # UPI 保持原有 IN/BR 双池；Kakao 固定 pool1=KR provider、pool2=VN promotion。
+    # UPI 保持原有 IN/BR 双池；Kakao 固定 pool1=KR provider，pool2 可用 JP/VN promotion。
     channel_region = cfg["country"]
+    promotion_country = str(cfg.get("promotion_country") or "VN").upper()
     if is_kakao:
         checkout_proxy, update_proxy = _kakao_proxy_chain(checkout_proxy, update_proxy)
-        poll_seconds = max(int(cfg.get("min_poll_seconds") or 0), int(poll_seconds or 0))
+        promotion_country = _proxy_country_hint(update_proxy) or promotion_country
+        if promotion_country not in tuple(cfg.get("promotion_countries") or ("VN",)):
+            promotion_country = str(cfg.get("promotion_country") or "VN").upper()
+        poll_seconds = int(cfg.get("poll_seconds") or 60)
     else:
         checkout_proxy = _force_region(checkout_proxy, channel_region)
 
     cffi = _import_cffi()
     if is_kakao:
-        emit("proxy_check", "校验 KR checkout/provider 与 VN promotion 出口", status="running")
+        emit(
+            "proxy_check",
+            f"校验 KR checkout/provider 与 {promotion_country} promotion 出口",
+            status="running",
+        )
         _preflight_kakao_proxy(cffi, checkout_proxy, cfg["provider_country"], "KR checkout/provider")
-        _preflight_kakao_proxy(cffi, update_proxy, cfg["promotion_country"], "VN promotion")
+        _preflight_kakao_proxy(cffi, update_proxy, promotion_country, f"{promotion_country} promotion")
     checkout_session = cffi.Session(impersonate="chrome")
     promotion_session = cffi.Session(impersonate="chrome") if is_kakao else checkout_session
     provider_session = cffi.Session(impersonate="chrome") if is_kakao else checkout_session
@@ -671,7 +694,7 @@ def generate_link(
         page = r.json()
         elements_session_id = _find(page, "elements_session_id") or elements_session_id
         if is_kakao:
-            amount = _validate_kakao_checkout(page, "VN promotion 后 KR refresh", require_zero=True)
+            amount = _validate_kakao_checkout(page, f"{promotion_country} promotion 后 KR refresh", require_zero=True)
             emit("taxes", "同步 OpenAI checkout/taxes 与 Stripe tax_region", status="running")
             _update_kakao_checkout_taxes(
                 provider_session, token, device_id, cs_id, processor, profile, checkout_proxy,
@@ -858,8 +881,9 @@ def generate_link(
         _require_ok(r, "stripe_confirm")
         confirm_payload = r.json() if is_kakao else {}
 
-        # UPI 保持原来始终并发 approve；Kakao 仅在 confirm 明确要求人工审批且尚无
-        # redirect 时审批。两者都保留 pool1 多出口并发命中能力。
+        # UPI 保持原来的多出口并发 approve。Kakao 的真实返回表明，同一个 checkout
+        # 在多个 KR IP 间并发审批会放大风控；因此 Kakao 全程固定 checkout_proxy，
+        # 单路审批失败后由上层放弃本 checkout，并换线路重新创建。
         stripe_redirect = _extract_link(confirm_payload, method) if is_kakao else ""
         submission = (
             confirm_payload.get("submission_attempt")
@@ -874,6 +898,7 @@ def generate_link(
             )
         )
         approve_states: list[str] = []
+        approve_http_statuses: list[int] = []
         states_lock = threading.Lock()
 
         def approve(proxy: str) -> None:
@@ -882,8 +907,9 @@ def generate_link(
                 return
             sess = None
             state = "error"
+            http_status = 0
             try:
-                if is_kakao:
+                if is_kakao and proxy != checkout_proxy:
                     _preflight_kakao_proxy(
                         cffi, proxy, cfg["provider_country"], "KR approve",
                     )
@@ -901,10 +927,11 @@ def generate_link(
                     json={"checkout_session_id": cs_id, "processor_entity": processor},
                     proxies=_proxy_dict(proxy), timeout=18,
                 )
+                http_status = int(resp.status_code or 0)
                 try:
-                    state = str((resp.json() or {}).get("result") or resp.status_code).lower()
+                    state = str((resp.json() or {}).get("result") or http_status).lower()
                 except Exception:
-                    state = str(resp.status_code)
+                    state = str(http_status)
             except Exception as exc:
                 state = "timeout" if "timeout" in type(exc).__name__.lower() else "error"
             finally:
@@ -915,21 +942,55 @@ def generate_link(
                     pass
             with states_lock:
                 approve_states.append(state)
+                approve_http_statuses.append(http_status)
             if state == "approved":
                 approved_flag.set()
 
         if should_approve:
-            exits = _approve_exits(checkout_pool, checkout_proxy, channel_region, approve_workers)
-            emit("approve", f"OpenAI 审批（{len(exits)} 路 {channel_region} 出口并发）", status="running")
-            for i, exit_proxy in enumerate(exits):
-                if approved_flag.is_set():
-                    break
-                t = threading.Thread(target=approve, args=(exit_proxy,), daemon=True)
-                t.start()
-                approve_threads.append(t)
-                time.sleep(0.05 if i < 4 else 0.08)
+            if is_kakao:
+                emit("approve", "OpenAI 审批（固定当前 KR 线路，单路）", status="running")
+                approve(checkout_proxy)
+                approve_state = approve_states[-1] if approve_states else "error"
+                emit(
+                    "approve",
+                    f"Kakao 单路审批结果：{approve_state}",
+                    status="success" if approve_state == "approved" else "warning",
+                    code=f"KAKAO_APPROVE_{approve_state.upper()}",
+                )
+            else:
+                exits = _approve_exits(checkout_pool, checkout_proxy, channel_region, approve_workers)
+                emit("approve", f"OpenAI 审批（{len(exits)} 路 {channel_region} 出口并发）", status="running")
+                for i, exit_proxy in enumerate(exits):
+                    if approved_flag.is_set():
+                        break
+                    t = threading.Thread(target=approve, args=(exit_proxy,), daemon=True)
+                    t.start()
+                    approve_threads.append(t)
+                    time.sleep(0.05 if i < 4 else 0.08)
 
         link = stripe_redirect
+        if is_kakao and should_approve and not approved_flag.is_set():
+            approve_http_status = approve_http_statuses[-1] if approve_http_statuses else 0
+            retryable_approve = not (
+                400 <= approve_http_status < 500
+                and approve_http_status not in (408, 429)
+            )
+            # blocked/error/timeout 已经说明当前 checkout 无法继续。不要再空轮询
+            # 60 秒；可重试状态交给上层换 KR sticky 线路建新 checkout。
+            # 明确 4xx（除 408/429）通常是凭据/请求问题，继续换代理没有意义。
+            return {
+                "ok": False,
+                "link": "",
+                "method": method,
+                "amount": amount,
+                "checkout_session_id": cs_id,
+                "approve_states": list(approve_states),
+                "approve_http_status": approve_http_status,
+                "stripe_redirect_url": "",
+                "provider_redirect_url": "",
+                "retryable": retryable_approve,
+                "retry_reason": f"approve_{approve_states[-1] if approve_states else 'error'}",
+            }
         poll_proxy = _force_region(checkout_proxy, channel_region)
         deadline = time.time() + max(5, poll_seconds)
         details_params_key = client_session_id
@@ -998,6 +1059,8 @@ def generate_link(
             "approve_states": list(approve_states),
             "stripe_redirect_url": stripe_redirect_url if is_kakao else "",
             "provider_redirect_url": link if is_kakao else "",
+            "retryable": bool(is_kakao and not link),
+            "retry_reason": "redirect_not_ready" if is_kakao and not link else "",
         }
     finally:
         approved_flag.set()
