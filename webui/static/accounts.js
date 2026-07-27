@@ -14,6 +14,7 @@ const state = {
   activeRtEmails: new Set(),
   active2faEmails: new Set(),
   activeLinkEmails: new Set(),
+  refreshing: false,
   modalData: null,
 };
 
@@ -115,7 +116,14 @@ function renderRows() {
   initIcons();
 }
 
-async function refresh(reset = false) {
+async function refresh(reset = false, { notify = false } = {}) {
+  if (state.refreshing) return;
+  state.refreshing = true;
+  const refreshButton = $("#refreshBtn");
+  const originalTitle = refreshButton.title;
+  let refreshAdjustedPage = false;
+  refreshButton.disabled = true;
+  refreshButton.title = "正在刷新列表";
   if (reset) state.page = 1;
   const offset = (state.page - 1) * state.pageSize;
   try {
@@ -124,7 +132,8 @@ async function refresh(reset = false) {
     state.total = result.total;
     if (state.page > totalPages()) {
       state.page = totalPages();
-      return refresh(false);
+      refreshAdjustedPage = true;
+      return;
     }
     renderRows();
     $("#pageInfo").textContent = `第 ${state.page} / ${totalPages()} 页 · ${state.total} 条`;
@@ -140,9 +149,15 @@ async function refresh(reset = false) {
     $("#updatedAt").textContent = `列表刷新 ${new Date().toLocaleTimeString("zh-CN", {hour:"2-digit", minute:"2-digit"})}`;
     $("#serverState").textContent = "服务正常";
     updateSelection();
+    if (notify) setToast("列表已刷新", "ok");
   } catch (error) {
     $("#serverState").textContent = "服务异常";
     setToast(`刷新失败：${error.message}`, "bad");
+  } finally {
+    state.refreshing = false;
+    refreshButton.disabled = false;
+    refreshButton.title = originalTitle || "刷新列表";
+    if (refreshAdjustedPage) void refresh(false, { notify });
   }
 }
 
@@ -322,7 +337,24 @@ function watchTask(taskId, label, busy = null, requestedEmails = []) {
       }
       state.taskTimer = setTimeout(poll, 900);
     } catch (error) {
-      $("#taskMeta").textContent = `任务查询失败：${error.message}`;
+      const detail = String(error?.message || error || "未知错误");
+      const missingTask = /(?:404|任务不存在|已过期)/.test(detail);
+      if (!missingTask) {
+        $("#taskMeta").textContent = `任务查询失败，正在重试：${detail}`;
+        state.taskTimer = setTimeout(poll, 1500);
+        return;
+      }
+      clearTimeout(state.taskTimer);
+      state.taskTimer = null;
+      busy?.emails.forEach(email => busy.set.delete(email));
+      renderRows();
+      updateSelection();
+      $("#taskState").textContent = "已中断";
+      $("#taskState").className = "task-state bad";
+      $("#taskMeta").textContent = "任务已中断";
+      $("#taskDetail").textContent = "服务重启或任务已过期，请重新提交。";
+      setToast("后台任务已中断，已解除按钮锁定", "bad");
+      await refresh(false);
     }
   };
   poll();
@@ -337,7 +369,7 @@ $("#filterSegment").addEventListener("click", event => {
   refresh(true);
 });
 
-$("#refreshBtn").addEventListener("click", () => refresh(false));
+$("#refreshBtn").addEventListener("click", () => refresh(false, { notify: true }));
 $("#pageSize").addEventListener("change", event => {
   state.pageSize = Number(event.target.value);
   state.selected.clear();

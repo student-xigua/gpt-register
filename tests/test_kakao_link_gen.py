@@ -579,6 +579,52 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
             ["a1b2c3d4", "e5f6a7b8", "c9d0e1f2"],
         )
 
+    def test_kakao_kr_and_promotion_sid_templates_share_each_attempt_sid(self):
+        db.save_proxy_pools({
+            "kakao_pool1": "http://user-region-kr-sid-{sid}-t-120:pass@checkout.example:8000",
+            "kakao_pool2": "http://user-region-vn-sid-{sid}-t-120:pass@promotion.example:8000",
+        })
+        blocked = {
+            "ok": False,
+            "link": "",
+            "amount": "0",
+            "approve_states": ["blocked"],
+            "retryable": True,
+            "retry_reason": "approve_blocked",
+        }
+        success = {
+            "ok": True,
+            "link": "https://pay.nicepay.co.kr/kakao/checkout",
+            "amount": "0",
+            "approve_states": ["approved"],
+        }
+        with (
+            mock.patch.object(account_ops, "_new_kakao_proxy_sid", side_effect=[
+                "a1b2c3d4", "e5f6a7b8", "c9d0e1f2",
+            ]),
+            mock.patch.object(
+                account_ops.link_gen,
+                "generate_link",
+                side_effect=[blocked, blocked, success],
+            ) as generate,
+        ):
+            task_id = account_ops.start_link_gen(["kakao@example.com"], "kakao")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                task = account_ops.get_task(task_id)
+                if task and task["state"] in {"done", "partial", "failed"} and task["finished_at"]:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("Kakao KR SID template task did not finish")
+
+        self.assertEqual(task["state"], "done")
+        self.assertEqual(generate.call_count, 3)
+        for call in generate.call_args_list:
+            checkout_sid = re.search(r"sid-([a-z0-9]{8})-t-120", call.kwargs["checkout_proxy"]).group(1)
+            promotion_sid = re.search(r"sid-([a-z0-9]{8})-t-120", call.kwargs["update_proxy"]).group(1)
+            self.assertEqual(checkout_sid, promotion_sid)
+
     def test_kakao_nonretryable_result_does_not_rebuild_checkout(self):
         db.save_proxy_pools({
             "kakao_pool1": "http://user-region-kr:pass@checkout.example:8000",
