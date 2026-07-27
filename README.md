@@ -38,6 +38,7 @@
 
 - **代理池1（KR checkout/provider）**：负责 OpenAI checkout、Stripe 初始化、OpenAI/Stripe 税务同步、Kakao `pre_confirm`、payment method、confirm、approve、轮询和最终 Kakao/Nicepay 跳转。执行前校验实际出口为韩国 `KR`。
 - **代理池2（VN promotion）**：只负责 OpenAI `checkout/update` 促销压价，执行前校验实际出口为越南 `VN`；留空时由代理池1中的代理通过 `country/region` 选择器派生 VN 出口。
+- **审批策略**：每个账号只创建 1 个 checkout；确认后在同一 `checkout_session_id` 上用代理池1发起 10 路 KR `approve` 并发尝试，同时轮询 Stripe 跳转，不再通过反复重建 checkout 重试。
 - Kakao checkout 必须同时满足 `kakao_pay`、`0 KRW`，最终链接必须跳转到 Kakao/Nicepay 主机；程序不会访问支付成功回调，也不会继续完成支付。
 
 ## 🎀 两种使用方式

@@ -886,9 +886,9 @@ def generate_link(
         _require_ok(r, "stripe_confirm")
         confirm_payload = r.json() if is_kakao else {}
 
-        # UPI 保持原来的多出口并发 approve。Kakao 的真实返回表明，同一个 checkout
-        # 在多个 KR IP 间并发审批会放大风控；因此 Kakao 全程固定 checkout_proxy，
-        # 单路审批失败后由上层放弃本 checkout，并换线路重新创建。
+        # UPI 与 Kakao 都在同一个 checkout 上并发 approve；各线程复用同一
+        # checkout_session_id / device_id，但使用独立 Session 与账单国出口。
+        # Kakao 不再因单路 blocked 重建整个 checkout。
         stripe_redirect = _extract_link(confirm_payload, method) if is_kakao else ""
         submission = (
             confirm_payload.get("submission_attempt")
@@ -904,24 +904,46 @@ def generate_link(
         )
         approve_states: list[str] = []
         approve_http_statuses: list[int] = []
+        approve_target_count = 0
+        approve_preflight_fallbacks = 0
+        approve_start_barrier: Optional[threading.Barrier] = None
         states_lock = threading.Lock()
 
         def approve(proxy: str) -> None:
+            nonlocal approve_preflight_fallbacks
             # 用独立 session 避免共享连接的线程安全问题。
-            if approved_flag.is_set():
+            # UPI 命中 approved 后可以短路；Kakao 实验/正式策略要求同一
+            # checkout 的十路提交都真正发出，因此不在请求前跳过 Kakao worker。
+            if approved_flag.is_set() and not is_kakao:
                 return
             sess = None
             state = "error"
             http_status = 0
+            request_proxy = proxy
             try:
                 if is_kakao and proxy != checkout_proxy:
-                    _preflight_kakao_proxy(
-                        cffi, proxy, cfg["provider_country"], "KR approve",
-                    )
-                if approved_flag.is_set():
+                    try:
+                        _preflight_kakao_proxy(
+                            cffi, proxy, cfg["provider_country"], "KR approve",
+                        )
+                    except Exception:
+                        # checkout_proxy 已在流程入口通过严格 KR 预检。某一路新 SID
+                        # 预检失败时回退该已验证出口，保证同一 checkout 仍真正发出
+                        # 目标数量的 approve，而不是只留下一个未提交的 error worker。
+                        request_proxy = checkout_proxy
+                        with states_lock:
+                            approve_preflight_fallbacks += 1
+                if is_kakao and approve_start_barrier is not None:
+                    try:
+                        # 两阶段执行：先让所有 KR worker 完成预检/回退，再统一放行 POST。
+                        approve_start_barrier.wait(timeout=60)
+                    except threading.BrokenBarrierError:
+                        # 超时只放宽同步，不取消本路实际提交。
+                        pass
+                if approved_flag.is_set() and not is_kakao:
                     return
                 sess = cffi.Session(impersonate="chrome")
-                if approved_flag.is_set():
+                if approved_flag.is_set() and not is_kakao:
                     return
                 resp = sess.post(
                     OAI_APPROVE,
@@ -930,7 +952,7 @@ def generate_link(
                              "Accept-Language": accept_language,
                              "Oai-Language": cfg["locale"]},
                     json={"checkout_session_id": cs_id, "processor_entity": processor},
-                    proxies=_proxy_dict(proxy), timeout=18,
+                    proxies=_proxy_dict(request_proxy), timeout=18,
                 )
                 http_status = int(resp.status_code or 0)
                 try:
@@ -952,50 +974,27 @@ def generate_link(
                 approved_flag.set()
 
         if should_approve:
-            if is_kakao:
-                emit("approve", "OpenAI 审批（固定当前 KR 线路，单路）", status="running")
-                approve(checkout_proxy)
-                approve_state = approve_states[-1] if approve_states else "error"
-                emit(
-                    "approve",
-                    f"Kakao 单路审批结果：{approve_state}",
-                    status="success" if approve_state == "approved" else "warning",
-                    code=f"KAKAO_APPROVE_{approve_state.upper()}",
-                )
-            else:
-                exits = _approve_exits(checkout_pool, checkout_proxy, channel_region, approve_workers)
-                emit("approve", f"OpenAI 审批（{len(exits)} 路 {channel_region} 出口并发）", status="running")
-                for i, exit_proxy in enumerate(exits):
-                    if approved_flag.is_set():
-                        break
-                    t = threading.Thread(target=approve, args=(exit_proxy,), daemon=True)
-                    t.start()
-                    approve_threads.append(t)
-                    time.sleep(0.05 if i < 4 else 0.08)
+            exits = _approve_exits(checkout_pool, checkout_proxy, channel_region, approve_workers)
+            approve_target_count = len(exits)
+            approve_start_barrier = (
+                threading.Barrier(approve_target_count)
+                if is_kakao and approve_target_count > 1
+                else None
+            )
+            emit(
+                "approve",
+                f"OpenAI 审批（同一 checkout，{len(exits)} 路 {channel_region} 出口并发）",
+                status="running",
+            )
+            for i, exit_proxy in enumerate(exits):
+                if approved_flag.is_set() and not is_kakao:
+                    break
+                t = threading.Thread(target=approve, args=(exit_proxy,), daemon=True)
+                t.start()
+                approve_threads.append(t)
+                time.sleep(0.05 if i < 4 else 0.08)
 
         link = stripe_redirect
-        if is_kakao and should_approve and not approved_flag.is_set():
-            approve_http_status = approve_http_statuses[-1] if approve_http_statuses else 0
-            retryable_approve = not (
-                400 <= approve_http_status < 500
-                and approve_http_status not in (408, 429)
-            )
-            # blocked/error/timeout 已经说明当前 checkout 无法继续。不要再空轮询
-            # 60 秒；可重试状态交给上层换 KR sticky 线路建新 checkout。
-            # 明确 4xx（除 408/429）通常是凭据/请求问题，继续换代理没有意义。
-            return {
-                "ok": False,
-                "link": "",
-                "method": method,
-                "amount": amount,
-                "checkout_session_id": cs_id,
-                "approve_states": list(approve_states),
-                "approve_http_status": approve_http_status,
-                "stripe_redirect_url": "",
-                "provider_redirect_url": "",
-                "retryable": retryable_approve,
-                "retry_reason": f"approve_{approve_states[-1] if approve_states else 'error'}",
-            }
         poll_proxy = _force_region(checkout_proxy, channel_region)
         deadline = time.time() + max(5, poll_seconds)
         details_params_key = client_session_id
@@ -1050,10 +1049,59 @@ def generate_link(
         for t in approve_threads:
             t.join()
 
+        if is_kakao and should_approve:
+            approved_count = approve_states.count("approved")
+            blocked_count = approve_states.count("blocked")
+            http_response_count = sum(status > 0 for status in approve_http_statuses)
+            no_http_count = max(0, approve_target_count - http_response_count)
+            emit(
+                "approve",
+                (
+                    f"Kakao 并发审批完成：worker {len(approve_states)}/{approve_target_count}，"
+                    f"HTTP 响应 {http_response_count}，approved {approved_count}，"
+                    f"blocked {blocked_count}，无 HTTP 响应 {no_http_count}，"
+                    f"预检回退 {approve_preflight_fallbacks}"
+                ),
+                status="success" if approved_count else "warning",
+                code="KAKAO_APPROVE_PARALLEL_COMPLETE",
+            )
+
         stripe_redirect_url = link
         if is_kakao and link:
             emit("redirect", "跟随 Kakao/Nicepay 最终跳转", status="running")
             link = _follow_kakao_redirect(provider_session, link, poll_proxy)
+
+        explicit_approve_4xx = next(
+            (
+                status for status in approve_http_statuses
+                if 400 <= status < 500 and status not in (408, 429)
+            ),
+            0,
+        )
+        approved = "approved" in approve_states
+        explicit_4xx_count = sum(
+            1 for status in approve_http_statuses
+            if 400 <= status < 500 and status not in (408, 429)
+        )
+        # 只有所有已完成的 approve 都是一致的明确 4xx 才归为凭据/请求不可重试。
+        # 混合 401 + blocked/network 更像出口差异，不能因单路线的 4xx 误导用户刷新 AT。
+        nonretryable_approve = bool(
+            approve_states
+            and explicit_4xx_count == len(approve_states)
+            and not approved
+        )
+        retry_reason = ""
+        if is_kakao and not link:
+            if approved:
+                retry_reason = "redirect_not_ready"
+            elif nonretryable_approve:
+                retry_reason = f"approve_{explicit_approve_4xx}"
+            elif approve_states and all(state == "blocked" for state in approve_states):
+                retry_reason = "approve_blocked"
+            elif approve_states and all(state in ("timeout", "error") for state in approve_states):
+                retry_reason = "approve_network"
+            else:
+                retry_reason = "approve_mixed"
 
         return {
             "ok": bool(link),
@@ -1062,10 +1110,11 @@ def generate_link(
             "amount": amount,
             "checkout_session_id": cs_id,
             "approve_states": list(approve_states),
+            "approve_http_status": explicit_approve_4xx,
             "stripe_redirect_url": stripe_redirect_url if is_kakao else "",
             "provider_redirect_url": link if is_kakao else "",
-            "retryable": bool(is_kakao and not link),
-            "retry_reason": "redirect_not_ready" if is_kakao and not link else "",
+            "retryable": bool(is_kakao and not link and not nonretryable_approve),
+            "retry_reason": retry_reason,
         }
     finally:
         approved_flag.set()

@@ -41,10 +41,18 @@ def kakao_page(amount: int, *, session_id: str) -> dict:
 
 
 class KakaoHttpScenario:
-    def __init__(self, *, post_promo_amount=0, confirm_requires_approval=False, poll_timeouts=0):
+    def __init__(
+        self,
+        *,
+        post_promo_amount=0,
+        confirm_requires_approval=False,
+        poll_timeouts=0,
+        poll_redirect=True,
+    ):
         self.post_promo_amount = post_promo_amount
         self.confirm_requires_approval = confirm_requires_approval
         self.poll_timeouts = poll_timeouts
+        self.poll_redirect = poll_redirect
         self.init_count = 0
         self.calls: list[tuple[str, str, dict]] = []
         self.sessions: list[FakeSession] = []
@@ -103,6 +111,8 @@ class KakaoHttpScenario:
             if self.poll_timeouts:
                 self.poll_timeouts -= 1
                 raise TimeoutError("transient Stripe poll timeout")
+            if not self.poll_redirect:
+                return FakeResponse(payload=kakao_page(0, session_id="es_waiting"))
             return FakeResponse(payload={
                 "payment_intent": {
                     "next_action": {
@@ -150,9 +160,18 @@ class KakaoLinkFlowTests(unittest.TestCase):
         preflight_calls = []
         checkout_proxy = kwargs.pop("checkout_proxy", self.checkout_seed)
         update_proxy = kwargs.pop("update_proxy", self.promotion_seed)
+        checkout_pool = kwargs.pop(
+            "checkout_pool",
+            [self.checkout_seed, "http://other-region-us:pass@other.example:8000"],
+        )
+        poll_seconds = kwargs.pop("poll_seconds", 5)
+        approve_workers = kwargs.pop("approve_workers", 2)
+        preflight_side_effect = kwargs.pop("preflight_side_effect", None)
 
         def preflight(_cffi, proxy, expected_country, label):
             preflight_calls.append((proxy, expected_country, label))
+            if preflight_side_effect:
+                return preflight_side_effect(proxy, expected_country, label)
 
         with (
             mock.patch.object(link_gen, "_import_cffi", return_value=FakeCffi(scenario)),
@@ -163,9 +182,9 @@ class KakaoLinkFlowTests(unittest.TestCase):
                 "kakao",
                 checkout_proxy=checkout_proxy,
                 update_proxy=update_proxy,
-                checkout_pool=[self.checkout_seed, "http://other-region-us:pass@other.example:8000"],
-                poll_seconds=5,
-                approve_workers=2,
+                checkout_pool=checkout_pool,
+                poll_seconds=poll_seconds,
+                approve_workers=approve_workers,
                 **kwargs,
             )
         return result, preflight_calls
@@ -223,18 +242,120 @@ class KakaoLinkFlowTests(unittest.TestCase):
         self.assertFalse(any(url == link_gen.OAI_APPROVE for method, url, _ in scenario.calls))
 
     def test_requires_approval_keeps_multi_exit_pool_and_then_polls(self):
-        scenario = KakaoHttpScenario(confirm_requires_approval=True)
-        result, _ = self.run_flow(scenario)
+        approve_pool = [
+            f"http://worker-{index}-region-us:pass@approve{index}.example:8000"
+            for index in range(10)
+        ]
+
+        class ConcurrentScenario(KakaoHttpScenario):
+            def __init__(self):
+                super().__init__(confirm_requires_approval=True)
+                self.approve_barrier = threading.Barrier(10)
+
+            def post(self, url, kwargs):
+                if url == link_gen.OAI_APPROVE:
+                    self.calls.append(("POST", url, kwargs))
+                    self.approve_barrier.wait(timeout=3)
+                    return FakeResponse(payload={"result": "approved"})
+                return super().post(url, kwargs)
+
+        scenario = ConcurrentScenario()
+        events = []
+
+        def log(phase, detail, **kwargs):
+            events.append((phase, detail, kwargs))
+
+        result, _ = self.run_flow(
+            scenario,
+            checkout_pool=approve_pool,
+            approve_workers=10,
+            log=log,
+        )
 
         self.assertTrue(result["ok"])
         self.assertIn("approved", result["approve_states"])
         approve_calls = [call for call in scenario.calls if call[1] == link_gen.OAI_APPROVE]
-        self.assertGreaterEqual(len(approve_calls), 1)
+        self.assertEqual(len(approve_calls), 10)
+        self.assertEqual(
+            {call[2]["json"]["checkout_session_id"] for call in approve_calls},
+            {"cs_test"},
+        )
+        self.assertEqual(
+            {call[2]["json"]["processor_entity"] for call in approve_calls},
+            {"openai_llc"},
+        )
+        self.assertEqual(len({call[2]["proxies"]["https"] for call in approve_calls}), 10)
         self.assertTrue(all("region-kr" in call[2]["proxies"]["https"] for call in approve_calls))
         self.assertFalse(any("region-vn" in call[2]["proxies"]["https"] for call in approve_calls))
+        self.assertEqual(len(scenario.sessions), 13)
+        self.assertTrue(all(session.closed for session in scenario.sessions))
+        self.assertTrue(any(
+            method == "GET" and url == f"{link_gen.STRIPE_API}/payment_pages/cs_test"
+            for method, url, _ in scenario.calls
+        ))
+        summary = next(
+            event for event in events
+            if event[2].get("code") == "KAKAO_APPROVE_PARALLEL_COMPLETE"
+        )
+        self.assertIn("worker 10/10", summary[1])
+        self.assertIn("HTTP 响应 10", summary[1])
+        self.assertIn("approved 10", summary[1])
         self.assertEqual(result["link"], "https://web.nicepay.co.kr/kakao/checkout")
 
-    def test_blocked_kakao_approval_uses_checkout_route_and_skips_empty_poll(self):
+    def test_kakao_failed_approve_preflight_falls_back_and_still_posts_ten(self):
+        approve_pool = [self.checkout_seed] + [
+            f"http://worker-{index}-region-us:pass@approve{index}.example:8000"
+            for index in range(9)
+        ]
+
+        class FallbackScenario(KakaoHttpScenario):
+            def __init__(self):
+                super().__init__(confirm_requires_approval=True)
+                self.approve_barrier = threading.Barrier(10)
+
+            def post(self, url, kwargs):
+                if url == link_gen.OAI_APPROVE:
+                    self.calls.append(("POST", url, kwargs))
+                    self.approve_barrier.wait(timeout=3)
+                    return FakeResponse(payload={"result": "approved"})
+                return super().post(url, kwargs)
+
+        def fail_one_preflight(proxy, _expected_country, label):
+            if label == "KR approve" and "approve5.example" in proxy:
+                raise RuntimeError("IP detector unavailable")
+
+        events = []
+
+        def log(phase, detail, **kwargs):
+            events.append((phase, detail, kwargs))
+
+        scenario = FallbackScenario()
+        result, _ = self.run_flow(
+            scenario,
+            checkout_pool=approve_pool,
+            approve_workers=10,
+            preflight_side_effect=fail_one_preflight,
+            log=log,
+        )
+
+        self.assertTrue(result["ok"])
+        approve_calls = [call for call in scenario.calls if call[1] == link_gen.OAI_APPROVE]
+        self.assertEqual(len(approve_calls), 10)
+        used_proxies = [call[2]["proxies"]["https"] for call in approve_calls]
+        checkout_proxy = next(
+            call for call in scenario.calls if call[1] == link_gen.OAI_CHECKOUT
+        )[2]["proxies"]["https"]
+        self.assertEqual(used_proxies.count(checkout_proxy), 2)
+        self.assertEqual(len(set(used_proxies)), 9)
+        summary = next(
+            event for event in events
+            if event[2].get("code") == "KAKAO_APPROVE_PARALLEL_COMPLETE"
+        )
+        self.assertIn("worker 10/10", summary[1])
+        self.assertIn("HTTP 响应 10", summary[1])
+        self.assertIn("预检回退 1", summary[1])
+
+    def test_blocked_kakao_parallel_approval_polls_same_checkout_before_failing(self):
         class BlockedScenario(KakaoHttpScenario):
             def post(self, url, kwargs):
                 if url == link_gen.OAI_APPROVE:
@@ -242,21 +363,21 @@ class KakaoLinkFlowTests(unittest.TestCase):
                     return FakeResponse(payload={"result": "blocked"})
                 return super().post(url, kwargs)
 
-        scenario = BlockedScenario(confirm_requires_approval=True)
-        result, _ = self.run_flow(scenario)
+        scenario = BlockedScenario(confirm_requires_approval=True, poll_redirect=False)
+        with (
+            mock.patch.object(link_gen.time, "time", side_effect=[0, 0, 0, 100]),
+            mock.patch.object(link_gen.time, "sleep", return_value=None),
+        ):
+            result, _ = self.run_flow(scenario)
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["retryable"])
         self.assertEqual(result["retry_reason"], "approve_blocked")
-        self.assertEqual(result["approve_states"], ["blocked"])
+        self.assertEqual(result["approve_states"].count("blocked"), 2)
         approve_calls = [call for call in scenario.calls if call[1] == link_gen.OAI_APPROVE]
-        checkout_call = next(call for call in scenario.calls if call[1] == link_gen.OAI_CHECKOUT)
-        self.assertEqual(len(approve_calls), 1)
-        self.assertEqual(
-            approve_calls[0][2]["proxies"]["https"],
-            checkout_call[2]["proxies"]["https"],
-        )
-        self.assertFalse(any(
+        self.assertEqual(len(approve_calls), 2)
+        self.assertTrue(all("region-kr" in call[2]["proxies"]["https"] for call in approve_calls))
+        self.assertTrue(any(
             method == "GET" and url == f"{link_gen.STRIPE_API}/payment_pages/cs_test"
             for method, url, _ in scenario.calls
         ))
@@ -269,14 +390,42 @@ class KakaoLinkFlowTests(unittest.TestCase):
                     return FakeResponse(status_code=401, payload={})
                 return super().post(url, kwargs)
 
-        scenario = UnauthorizedScenario(confirm_requires_approval=True)
-        result, _ = self.run_flow(scenario)
+        scenario = UnauthorizedScenario(confirm_requires_approval=True, poll_redirect=False)
+        with (
+            mock.patch.object(link_gen.time, "time", side_effect=[0, 0, 0, 100]),
+            mock.patch.object(link_gen.time, "sleep", return_value=None),
+        ):
+            result, _ = self.run_flow(scenario)
 
         self.assertFalse(result["ok"])
         self.assertFalse(result["retryable"])
         self.assertEqual(result["retry_reason"], "approve_401")
         self.assertEqual(result["approve_http_status"], 401)
-        self.assertEqual(result["approve_states"], ["401"])
+        self.assertEqual(result["approve_states"].count("401"), 2)
+
+    def test_mixed_401_and_blocked_approval_remains_retryable(self):
+        class MixedScenario(KakaoHttpScenario):
+            def post(self, url, kwargs):
+                if url == link_gen.OAI_APPROVE:
+                    self.calls.append(("POST", url, kwargs))
+                    proxy = kwargs["proxies"]["https"]
+                    if "checkout.example" in proxy:
+                        return FakeResponse(status_code=401, payload={})
+                    return FakeResponse(payload={"result": "blocked"})
+                return super().post(url, kwargs)
+
+        scenario = MixedScenario(confirm_requires_approval=True, poll_redirect=False)
+        with (
+            mock.patch.object(link_gen.time, "time", side_effect=[0, 0, 0, 100]),
+            mock.patch.object(link_gen.time, "sleep", return_value=None),
+        ):
+            result, _ = self.run_flow(scenario)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["retry_reason"], "approve_mixed")
+        self.assertEqual(result["approve_http_status"], 401)
+        self.assertEqual(set(result["approve_states"]), {"401", "blocked"})
 
     def test_transient_stripe_poll_timeout_retries_within_total_window(self):
         scenario = KakaoHttpScenario(confirm_requires_approval=True, poll_timeouts=1)
@@ -296,6 +445,96 @@ class KakaoLinkFlowTests(unittest.TestCase):
             if call[0] == "GET" and call[1] == f"{link_gen.STRIPE_API}/payment_pages/cs_test"
         ]
         self.assertEqual(len(poll_calls), 2)
+
+    def test_upi_shared_approve_branch_keeps_early_success_short_circuit(self):
+        class UpiScenario:
+            def __init__(self):
+                self.calls = []
+                self.sessions = []
+
+            def session(self, impersonate="chrome"):
+                session = FakeSession(self)
+                self.sessions.append(session)
+                return session
+
+            @staticmethod
+            def page():
+                return {
+                    "currency": "inr",
+                    "payment_method_types": ["upi"],
+                    "ordered_payment_method_types": ["upi"],
+                    "elements_options": {"amount": 0},
+                    "elements_session_id": "es_upi",
+                    "config_id": "cfg_upi",
+                    "init_checksum": "checksum_upi",
+                }
+
+            def post(self, url, kwargs):
+                self.calls.append(("POST", url, kwargs))
+                if url == link_gen.OAI_CHECKOUT:
+                    return FakeResponse(payload={
+                        "checkout_session_id": "cs_upi",
+                        "publishable_key": "pk_upi",
+                        "processor_entity": "openai_llc",
+                    })
+                if url == link_gen.OAI_UPDATE:
+                    return FakeResponse(payload={"success": True})
+                if url.endswith("/payment_pages/cs_upi/init"):
+                    return FakeResponse(payload=self.page())
+                if url.endswith("/payment_pages/cs_upi"):
+                    return FakeResponse(payload=self.page())
+                if url.endswith("/payment_methods"):
+                    return FakeResponse(payload={"id": "pm_upi_test"})
+                if url.endswith("/payment_pages/cs_upi/confirm"):
+                    return FakeResponse(payload={})
+                if url == link_gen.OAI_APPROVE:
+                    proxy = kwargs["proxies"]["https"]
+                    state = "blocked" if "approve1.example" in proxy else "approved"
+                    return FakeResponse(payload={"result": state})
+                raise AssertionError(f"unexpected POST {url}")
+
+            def get(self, url, kwargs):
+                self.calls.append(("GET", url, kwargs))
+                if url == f"{link_gen.STRIPE_API}/payment_pages/cs_upi":
+                    return FakeResponse(payload={
+                        "next_action": {
+                            "redirect_to_url": {
+                                "url": "https://payments.stripe.com/upi/instructions/demo",
+                            }
+                        }
+                    })
+                raise AssertionError(f"unexpected GET {url}")
+
+        scenario = UpiScenario()
+        approve_pool = [
+            f"http://user-region-us:pass@approve{index}.example:8000"
+            for index in range(1, 4)
+        ]
+        with (
+            mock.patch.object(link_gen, "_import_cffi", return_value=FakeCffi(scenario)),
+            mock.patch.object(link_gen.random, "randrange", return_value=0),
+        ):
+            result = link_gen.generate_link(
+                "access-token",
+                "upi",
+                checkout_proxy=approve_pool[0],
+                update_proxy="http://user-region-br:pass@promotion.example:8000",
+                checkout_pool=approve_pool,
+                poll_seconds=5,
+                approve_workers=3,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["link"],
+            "https://payments.stripe.com/upi/instructions/demo",
+        )
+        approve_calls = [call for call in scenario.calls if call[1] == link_gen.OAI_APPROVE]
+        self.assertEqual(len(approve_calls), 2)
+        self.assertEqual(result["approve_states"].count("blocked"), 1)
+        self.assertEqual(result["approve_states"].count("approved"), 1)
+        self.assertTrue(all("region-in" in call[2]["proxies"]["https"] for call in approve_calls))
+        self.assertTrue(all(session.closed for session in scenario.sessions))
 
     def test_nonzero_kakao_checkout_stops_before_taxes_and_confirm(self):
         scenario = KakaoHttpScenario(post_promo_amount=12000)
@@ -440,20 +679,18 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
         row = db.list_registered(limit=10)[0]
         self.assertEqual(row["links"]["kakao"]["link"], final_link)
 
-    def test_background_kakao_restarts_full_checkout_on_single_route_block(self):
+    def test_background_kakao_uses_one_checkout_and_ten_parallel_approvals(self):
         checkout_lines = [
-            f"http://user-region-kr-{index}:pass@checkout{index}.example:8000"
+            f"http://user-region-kr-sid-{{sid}}-line-{index}:pass@checkout{index}.example:8000"
             for index in range(1, 4)
         ]
-        db.save_proxy_pools({"kakao_pool1": "\n".join(checkout_lines)})
-        blocked = {
-            "ok": False,
-            "link": "",
-            "amount": "0",
-            "approve_states": ["blocked"],
-            "retryable": True,
-            "retry_reason": "approve_blocked",
-        }
+        promotion_template = (
+            "http://user-region-vn-sid-{sid}:pass@promotion.example:8000"
+        )
+        db.save_proxy_pools({
+            "kakao_pool1": "\n".join(checkout_lines),
+            "kakao_pool2": promotion_template,
+        })
         final_link = "https://web.nicepay.co.kr/kakao/checkout"
         success = {
             "ok": True,
@@ -463,13 +700,19 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
             "retryable": False,
             "retry_reason": "",
         }
+        sids = [f"{index:08x}" for index in range(1, 12)]
 
         with (
-            mock.patch.object(account_ops.random, "sample", return_value=checkout_lines),
+            mock.patch.object(
+                account_ops.random,
+                "choice",
+                side_effect=[checkout_lines[0], promotion_template],
+            ),
+            mock.patch.object(account_ops, "_new_kakao_proxy_sid", side_effect=sids),
             mock.patch.object(
                 account_ops.link_gen,
                 "generate_link",
-                side_effect=[blocked, blocked, success],
+                return_value=success,
             ) as generate,
         ):
             task_id = account_ops.start_link_gen(["kakao@example.com"], "kakao")
@@ -480,37 +723,45 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
                     break
                 time.sleep(0.01)
             else:
-                self.fail("Kakao retry task did not finish")
+                self.fail("Kakao single-checkout task did not finish")
 
         self.assertEqual(task["state"], "done")
-        self.assertEqual(generate.call_count, 3)
-        used_proxies = [call.kwargs["checkout_proxy"] for call in generate.call_args_list]
-        self.assertEqual(used_proxies, checkout_lines)
-        for call in generate.call_args_list:
-            self.assertEqual(call.kwargs["checkout_pool"], [call.kwargs["checkout_proxy"]])
-            self.assertEqual(call.kwargs["approve_workers"], 1)
+        self.assertEqual(generate.call_count, 1)
+        call = generate.call_args
+        approve_pool = call.kwargs["checkout_pool"]
+        self.assertEqual(call.kwargs["approve_workers"], 10)
+        self.assertEqual(len(approve_pool), 10)
+        self.assertEqual(len(set(approve_pool)), 10)
+        self.assertIn(call.kwargs["checkout_proxy"], approve_pool)
+        self.assertTrue(all("region-kr" in proxy for proxy in approve_pool))
+        self.assertTrue(all("{sid}" not in proxy for proxy in approve_pool))
+        self.assertIn("region-vn", call.kwargs["update_proxy"])
+        self.assertNotIn("{sid}", call.kwargs["update_proxy"])
+        kr_sids = {
+            re.search(r"sid-([a-z0-9]{8})", proxy).group(1)
+            for proxy in approve_pool
+        }
+        promotion_sid = re.search(
+            r"sid-([a-z0-9]{8})", call.kwargs["update_proxy"],
+        ).group(1)
+        self.assertNotIn(promotion_sid, kr_sids)
+        event_codes = [event.get("code") for event in task["events"]]
+        self.assertEqual(event_codes.count("KAKAO_SINGLE_CHECKOUT"), 1)
+        self.assertNotIn("KAKAO_RETRY_NEW_CHECKOUT", event_codes)
         row = db.get_registered("kakao@example.com")
         self.assertEqual(row["extra"]["links"]["kakao"]["link"], final_link)
 
-    def test_background_kakao_retries_transient_network_error(self):
+    def test_background_kakao_does_not_rebuild_checkout_after_network_error(self):
         checkout_lines = [
             "http://user-region-kr-1:pass@checkout1.example:8000",
             "http://user-region-kr-2:pass@checkout2.example:8000",
         ]
         db.save_proxy_pools({"kakao_pool1": "\n".join(checkout_lines)})
-        final_link = "https://web.nicepay.co.kr/kakao/checkout"
-        success = {
-            "ok": True,
-            "link": final_link,
-            "amount": "0",
-            "approve_states": ["approved"],
-        }
         with (
-            mock.patch.object(account_ops.random, "sample", return_value=checkout_lines),
             mock.patch.object(
                 account_ops.link_gen,
                 "generate_link",
-                side_effect=[TimeoutError("curl: (28) Operation timed out"), success],
+                side_effect=TimeoutError("curl: (28) Operation timed out"),
             ) as generate,
         ):
             task_id = account_ops.start_link_gen(["kakao@example.com"], "kakao")
@@ -521,48 +772,28 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
                     break
                 time.sleep(0.01)
             else:
-                self.fail("Kakao transient retry task did not finish")
+                self.fail("Kakao network failure task did not finish")
 
-        self.assertEqual(task["state"], "done")
-        self.assertEqual(generate.call_count, 2)
-        self.assertEqual(task["succeeded"], 1)
-        self.assertTrue(any(
-            event.get("code") == "KAKAO_RETRY_NETWORK"
-            for event in task["events"]
-        ))
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(generate.call_count, 1)
+        event_codes = [event.get("code") for event in task["events"]]
+        self.assertEqual(event_codes.count("KAKAO_SINGLE_CHECKOUT"), 1)
+        self.assertNotIn("KAKAO_RETRY_NETWORK", event_codes)
 
-    def test_kakao_sid_template_gets_three_unique_promotion_proxies(self):
-        checkout_proxy = "http://user-region-kr-fixed:pass@checkout.example:8000"
-        promotion_template = "http://user-region-jp-sid-{sid}-t-120:pass@promotion.example:8000"
-        db.save_proxy_pools({
-            "kakao_pool1": checkout_proxy,
-            "kakao_pool2": promotion_template,
-        })
+    def test_background_kakao_does_not_rebuild_retryable_no_link_checkout(self):
         blocked = {
             "ok": False,
             "link": "",
             "amount": "0",
-            "approve_states": ["blocked"],
+            "approve_states": ["blocked"] * 10,
             "retryable": True,
             "retry_reason": "approve_blocked",
         }
-        success = {
-            "ok": True,
-            "link": "https://web.nicepay.co.kr/kakao/checkout",
-            "amount": "0",
-            "approve_states": ["approved"],
-        }
-
-        with (
-            mock.patch.object(account_ops, "_new_kakao_proxy_sid", side_effect=[
-                "a1b2c3d4", "e5f6a7b8", "c9d0e1f2",
-            ]),
-            mock.patch.object(
-                account_ops.link_gen,
-                "generate_link",
-                side_effect=[blocked, blocked, success],
-            ) as generate,
-        ):
+        with mock.patch.object(
+            account_ops.link_gen,
+            "generate_link",
+            return_value=blocked,
+        ) as generate:
             task_id = account_ops.start_link_gen(["kakao@example.com"], "kakao")
             deadline = time.time() + 2
             while time.time() < deadline:
@@ -571,73 +802,36 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
                     break
                 time.sleep(0.01)
             else:
-                self.fail("Kakao SID template retry task did not finish")
+                self.fail("Kakao blocked task did not finish")
 
-        self.assertEqual(task["state"], "done")
-        self.assertEqual(generate.call_count, 3)
-        promotion_proxies = [call.kwargs["update_proxy"] for call in generate.call_args_list]
-        self.assertEqual(len(set(promotion_proxies)), 3)
-        self.assertTrue(all("{sid}" not in proxy for proxy in promotion_proxies))
-        self.assertEqual(
-            [re.search(r"sid-([a-z0-9]{8})-t-120", proxy).group(1) for proxy in promotion_proxies],
-            ["a1b2c3d4", "e5f6a7b8", "c9d0e1f2"],
-        )
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(generate.call_count, 1)
+        event_codes = [event.get("code") for event in task["events"]]
+        self.assertEqual(event_codes.count("KAKAO_SINGLE_CHECKOUT"), 1)
+        self.assertNotIn("KAKAO_RETRY_NEW_CHECKOUT", event_codes)
 
-    def test_kakao_kr_and_promotion_sid_templates_use_distinct_sids_per_attempt(self):
-        db.save_proxy_pools({
-            "kakao_pool1": "http://user-region-kr-sid-{sid}-t-120:pass@checkout.example:8000",
-            "kakao_pool2": "http://user-region-vn-sid-{sid}-t-120:pass@promotion.example:8000",
-        })
-        blocked = {
-            "ok": False,
-            "link": "",
-            "amount": "0",
-            "approve_states": ["blocked"],
-            "retryable": True,
-            "retry_reason": "approve_blocked",
-        }
-        success = {
-            "ok": True,
-            "link": "https://pay.nicepay.co.kr/kakao/checkout",
-            "amount": "0",
-            "approve_states": ["approved"],
-        }
-        with (
-            mock.patch.object(account_ops, "_new_kakao_proxy_sid", side_effect=[
-                "a1b2c3d4", "b1c2d3e4", "e5f6a7b8", "f5e6d7c8", "c9d0e1f2", "d9c0b1a2",
-            ]),
-            mock.patch.object(
-                account_ops.link_gen,
-                "generate_link",
-                side_effect=[blocked, blocked, success],
-            ) as generate,
-        ):
-            task_id = account_ops.start_link_gen(["kakao@example.com"], "kakao")
-            deadline = time.time() + 2
-            while time.time() < deadline:
-                task = account_ops.get_task(task_id)
-                if task and task["state"] in {"done", "partial", "failed"} and task["finished_at"]:
-                    break
-                time.sleep(0.01)
-            else:
-                self.fail("Kakao KR SID template task did not finish")
+    def test_kakao_fixed_proxy_repeats_to_keep_ten_submissions(self):
+        fixed = "http://user-region-kr:pass@checkout.example:8000"
 
-        self.assertEqual(task["state"], "done")
-        self.assertEqual(generate.call_count, 3)
-        sid_pairs = []
-        for call in generate.call_args_list:
-            checkout_sid = re.search(r"sid-([a-z0-9]{8})-t-120", call.kwargs["checkout_proxy"]).group(1)
-            promotion_sid = re.search(r"sid-([a-z0-9]{8})-t-120", call.kwargs["update_proxy"]).group(1)
-            self.assertNotEqual(checkout_sid, promotion_sid)
-            sid_pairs.append((checkout_sid, promotion_sid))
-        self.assertEqual(
-            sid_pairs,
-            [
-                ("a1b2c3d4", "b1c2d3e4"),
-                ("e5f6a7b8", "f5e6d7c8"),
-                ("c9d0e1f2", "d9c0b1a2"),
-            ],
-        )
+        approve_pool = account_ops._kakao_approve_pool([fixed], fixed)
+
+        self.assertEqual(len(approve_pool), 10)
+        self.assertEqual(approve_pool, [fixed] * 10)
+
+    def test_kakao_fixed_pool_does_not_duplicate_checkout_when_ten_lines_exist(self):
+        proxies = [
+            f"http://user-region-kr-{index}:pass@checkout{index}.example:8000"
+            for index in range(10)
+        ]
+        checkout_proxy = proxies[4]
+
+        with mock.patch.object(account_ops.random, "sample", return_value=proxies):
+            approve_pool = account_ops._kakao_approve_pool(proxies, checkout_proxy)
+
+        self.assertEqual(len(approve_pool), 10)
+        self.assertEqual(len(set(approve_pool)), 10)
+        self.assertEqual(set(approve_pool), set(proxies))
+        self.assertEqual(approve_pool.count(checkout_proxy), 1)
 
     def test_kakao_nonretryable_result_does_not_rebuild_checkout(self):
         db.save_proxy_pools({

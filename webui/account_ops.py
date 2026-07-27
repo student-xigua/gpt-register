@@ -27,8 +27,8 @@ from .sms_runtime import build_sms_controller
 
 logger = logging.getLogger("webui.account_ops")
 TASK_TTL_SECONDS = 3600
-KAKAO_MAX_FULL_ATTEMPTS = 3
 KAKAO_ACCOUNT_WORKERS = 5
+KAKAO_APPROVE_WORKERS = 10
 KAKAO_PROXY_SID_PLACEHOLDER = "{sid}"
 PHASE_LABELS = {
     "queued": "等待执行",
@@ -187,34 +187,6 @@ def _error_payload(exc: Exception) -> dict:
 def _safe_error(exc: Exception) -> str:
     """兼容原调用方的安全错误文本。"""
     return _error_payload(exc)["message"]
-
-
-def _is_retryable_kakao_error(exc: Exception) -> bool:
-    """判断 Kakao 提链是否应换线路重建 checkout。"""
-    detail = str(exc or "").lower()
-    fatal_markers = (
-        "checkout_not_kakao_trial",
-        "促销未生效",
-        "没有可用的网页 access token",
-        "http 400",
-        "http 401",
-        "http 403",
-    )
-    if any(marker in detail for marker in fatal_markers):
-        return False
-    retryable_markers = (
-        "timeout",
-        "timed out",
-        "curl: (",
-        "代理",
-        "proxy",
-        "connection",
-        "network",
-        "http 408",
-        "http 429",
-        "http 5",
-    )
-    return any(marker in detail for marker in retryable_markers)
 
 
 def _safe_filename_email(email: str) -> str:
@@ -429,7 +401,7 @@ def _pick_proxy(pool_text: str) -> str:
 
 
 def _new_kakao_proxy_sid() -> str:
-    """生成 8 位 sticky session ID，用于让每个新 checkout 更换出口 IP。"""
+    """生成 8 位 sticky session ID，用于隔离 Kakao checkout / approve 出口。"""
     return secrets.token_hex(4)
 
 
@@ -439,17 +411,37 @@ def _materialize_proxy_template(proxy: str, sid: str) -> str:
     return text.replace(KAKAO_PROXY_SID_PLACEHOLDER, sid) if sid else text
 
 
-def _kakao_checkout_templates(pool1_lines: list[str], attempt_count: int) -> list[str]:
-    """为 Kakao 完整重建选择模板。
+def _kakao_approve_pool(
+    pool1_lines: list[str],
+    checkout_proxy: str,
+    worker_count: int = KAKAO_APPROVE_WORKERS,
+) -> list[str]:
+    """物化同一 checkout 的 KR 并发 approve 出口。
 
-    固定代理最多只试池中不同线路；若任一 Kakao 池含 ``{sid}`` sticky 模板，
-    则可以在同一条模板上生成 3 个不同会话，每次都对应全新 checkout。
+    首路复用创建 checkout 的 sticky 会话，其余线路从代理池模板轮换；模板含
+    ``{sid}`` 时为每一路生成独立会话。固定代理不足 ``worker_count`` 条时允许
+    重复，用于保持“一个 checkout、十次并发提交”的请求次数。
     """
     templates = [line for line in pool1_lines if line]
+    count = max(1, int(worker_count or 1))
     if not templates:
-        return []
+        return [checkout_proxy] * count
     shuffled = random.sample(templates, k=len(templates))
-    return [shuffled[index % len(shuffled)] for index in range(max(1, int(attempt_count)))]
+    # 固定代理的 checkout 已占首路；从候选中移除同一条，避免池中线路足够时
+    # 仍重复 checkout 出口并漏掉另一条固定线路。{sid} 模板每次物化都会换会话，
+    # 可以继续参与后续 worker。
+    remaining = [
+        template for template in shuffled
+        if KAKAO_PROXY_SID_PLACEHOLDER in template or template != checkout_proxy
+    ]
+    if not remaining:
+        remaining = shuffled
+    proxies = [checkout_proxy]
+    for index in range(count - 1):
+        template = remaining[index % len(remaining)]
+        sid = _new_kakao_proxy_sid() if KAKAO_PROXY_SID_PLACEHOLDER in template else ""
+        proxies.append(_materialize_proxy_template(template, sid))
+    return proxies
 
 
 def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) -> str:
@@ -498,24 +490,13 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                         "账号不在已注册列表里。",
                         "请先完成注册或导入该账号的凭证后重试。",
                     )
-                if method == "kakao":
-                    has_sid_template = any(
-                        KAKAO_PROXY_SID_PLACEHOLDER in line
-                        for line in (*pool1_lines, *pool2_lines)
-                    )
-                    attempt_count = (
-                        KAKAO_MAX_FULL_ATTEMPTS
-                        if has_sid_template
-                        else min(KAKAO_MAX_FULL_ATTEMPTS, len(pool1_lines))
-                    )
-                    checkout_candidates = _kakao_checkout_templates(pool1_lines, attempt_count)
-                else:
-                    attempt_count = 1
-                    checkout_candidates = [random.choice(pool1_lines)]
+                # 每个账号只创建一个 checkout。Kakao 的命中能力放在同一 checkout
+                # 的十路并发 approve 上，不再用最多三次完整重建放大前置请求。
+                checkout_candidates = [random.choice(pool1_lines)]
 
                 result: dict = {}
                 link = ""
-                for attempt_index, checkout_template in enumerate(checkout_candidates, start=1):
+                for checkout_template in checkout_candidates:
                     update_template = random.choice(pool2_lines) if pool2_lines else checkout_template
                     # 账单 KR 与 JP/VN 促销必须使用独立 sticky SID。部分代理商会按
                     # SID 而不是「国家 + SID」绑定出口；若共用 SID，先建立的 KR
@@ -532,51 +513,30 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                     )
                     checkout_proxy = _materialize_proxy_template(checkout_template, checkout_sid)
                     update_proxy = _materialize_proxy_template(update_template, promotion_sid)
+                    approve_pool = (
+                        _kakao_approve_pool(pool1_lines, checkout_proxy)
+                        if method == "kakao"
+                        else pool1_lines
+                    )
                     if method == "kakao":
                         progress(
                             "attempt",
-                            f"Kakao 第 {attempt_index}/{attempt_count} 次：新建 checkout（KR 与 JP/VN 使用独立 sticky 会话）",
+                            "Kakao 单 checkout：KR 与 JP/VN 使用独立 sticky 会话，确认后十路并发审批",
                             status="running",
-                            code="KAKAO_NEW_CHECKOUT",
+                            code="KAKAO_SINGLE_CHECKOUT",
                         )
-                    try:
-                        result = link_gen.generate_link(
-                            str(cred.get("access_token") or ""),
-                            method,
-                            checkout_proxy=checkout_proxy,
-                            update_proxy=update_proxy,
-                            checkout_pool=[checkout_proxy] if method == "kakao" else pool1_lines,
-                            poll_seconds=poll_seconds,
-                            approve_workers=1 if method == "kakao" else 10,
-                            log=progress,
-                        )
-                    except Exception as exc:
-                        if (
-                            method == "kakao"
-                            and attempt_index < attempt_count
-                            and _is_retryable_kakao_error(exc)
-                        ):
-                            progress(
-                                "retry",
-                                f"本次线路异常（{type(exc).__name__}），更换 KR 线路重新开始",
-                                status="warning",
-                                code="KAKAO_RETRY_NETWORK",
-                            )
-                            continue
-                        raise
-                    link = str(result.get("link") or "").strip()
-                    if link or method != "kakao" or attempt_index >= attempt_count:
-                        break
-                    if method == "kakao" and result.get("retryable") is False:
-                        break
-                    approve_states = list(result.get("approve_states") or [])
-                    retry_reason = str(result.get("retry_reason") or "redirect_not_ready")
-                    progress(
-                        "retry",
-                        f"本次未拿到链接（{retry_reason}，审批={approve_states or ['none']}），更换 KR 线路重新开始",
-                        status="warning",
-                        code="KAKAO_RETRY_NEW_CHECKOUT",
+                    result = link_gen.generate_link(
+                        str(cred.get("access_token") or ""),
+                        method,
+                        checkout_proxy=checkout_proxy,
+                        update_proxy=update_proxy,
+                        checkout_pool=approve_pool,
+                        poll_seconds=poll_seconds,
+                        approve_workers=KAKAO_APPROVE_WORKERS if method == "kakao" else 10,
+                        log=progress,
                     )
+                    link = str(result.get("link") or "").strip()
+                    break
                 if not link:
                     states = result.get("approve_states") or []
                     retry_reason = str(result.get("retry_reason") or "")
