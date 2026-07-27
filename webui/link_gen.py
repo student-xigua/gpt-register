@@ -73,7 +73,7 @@ METHODS: dict[str, dict] = {
         "timezone": "Asia/Seoul",
         "accept_language": "ko-KR,ko;q=0.9,en;q=0.8",
         "pm_type": "kakao_pay",
-        # Kakao 只接受促销生效后的 0 KRW checkout，并用同一 sticky Seed 派生地区。
+        # Kakao 只接受促销生效后的 0 KRW checkout；KR 与 JP/VN 各自保持独立 sticky 会话。
         "require_zero": True,
         "promotion_country": "VN",
         "promotion_countries": ("JP", "VN"),

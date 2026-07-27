@@ -516,14 +516,26 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                 result: dict = {}
                 link = ""
                 for attempt_index, checkout_template in enumerate(checkout_candidates, start=1):
-                    attempt_sid = _new_kakao_proxy_sid() if method == "kakao" else ""
-                    checkout_proxy = _materialize_proxy_template(checkout_template, attempt_sid)
                     update_template = random.choice(pool2_lines) if pool2_lines else checkout_template
-                    update_proxy = _materialize_proxy_template(update_template, attempt_sid)
+                    # 账单 KR 与 JP/VN 促销必须使用独立 sticky SID。部分代理商会按
+                    # SID 而不是「国家 + SID」绑定出口；若共用 SID，先建立的 KR
+                    # 会话会把后续 JP/VN 请求也粘到 KR，导致促销预检直接失败。
+                    checkout_sid = (
+                        _new_kakao_proxy_sid()
+                        if method == "kakao" and KAKAO_PROXY_SID_PLACEHOLDER in checkout_template
+                        else ""
+                    )
+                    promotion_sid = (
+                        _new_kakao_proxy_sid()
+                        if method == "kakao" and KAKAO_PROXY_SID_PLACEHOLDER in update_template
+                        else ""
+                    )
+                    checkout_proxy = _materialize_proxy_template(checkout_template, checkout_sid)
+                    update_proxy = _materialize_proxy_template(update_template, promotion_sid)
                     if method == "kakao":
                         progress(
                             "attempt",
-                            f"Kakao 第 {attempt_index}/{attempt_count} 次：固定单一 KR 线路创建新 checkout",
+                            f"Kakao 第 {attempt_index}/{attempt_count} 次：新建 checkout（KR 与 JP/VN 使用独立 sticky 会话）",
                             status="running",
                             code="KAKAO_NEW_CHECKOUT",
                         )
