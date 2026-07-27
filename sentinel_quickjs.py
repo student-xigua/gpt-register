@@ -165,22 +165,49 @@ def _fetch_sentinel_challenge(
     flow: str,
     request_p: str,
     timeout_ms: int,
+    user_agent: str = "",
+    accept_language: str = "",
+    sec_ch_ua: str = "",
+    sec_ch_ua_platform: str = "",
+    sec_ch_ua_mobile: str = "",
+    sec_ch_ua_full_version_list: str = "",
+    sec_ch_ua_arch: str = "",
+    sec_ch_ua_bitness: str = "",
+    sec_ch_ua_model: Optional[str] = None,
+    sec_ch_ua_platform_version: str = "",
 ) -> dict:
     body = {"p": request_p, "id": device_id, "flow": flow}
+    headers = {
+        "origin": "https://sentinel.openai.com",
+        "referer": f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={SENTINEL_VERSION}",
+        "content-type": "text/plain;charset=UTF-8",
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+    if user_agent:
+        headers["user-agent"] = user_agent
+    if accept_language:
+        headers["accept-language"] = accept_language
+    if sec_ch_ua:
+        headers["sec-ch-ua"] = sec_ch_ua
+        headers["sec-ch-ua-mobile"] = sec_ch_ua_mobile or "?0"
+        headers["sec-ch-ua-platform"] = sec_ch_ua_platform or '"Windows"'
+        for value, header_name in (
+            (sec_ch_ua_full_version_list, "sec-ch-ua-full-version-list"),
+            (sec_ch_ua_arch, "sec-ch-ua-arch"),
+            (sec_ch_ua_bitness, "sec-ch-ua-bitness"),
+            (sec_ch_ua_model, "sec-ch-ua-model"),
+            (sec_ch_ua_platform_version, "sec-ch-ua-platform-version"),
+        ):
+            if value is not None and value != "":
+                headers[header_name] = value
     resp = session.post(
         SENTINEL_REQ_URL,
         data=json.dumps(body, separators=(",", ":")),
-        headers={
-            "origin": "https://sentinel.openai.com",
-            "referer": f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={SENTINEL_VERSION}",
-            "content-type": "text/plain;charset=UTF-8",
-            "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br, zstd",
-            "accept-language": "zh-CN,zh;q=0.9",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-        },
+        headers=headers,
         timeout=max(10, int(timeout_ms / 1000)),
     )
     if getattr(resp, "status_code", 0) != 200:
@@ -202,6 +229,22 @@ def get_sentinel_token_via_quickjs(
     screen: str = "",
     lang: str = "",
     lang_full: str = "",
+    browser_type: str = "",
+    platform: str = "",
+    vendor: Optional[str] = None,
+    hardware_concurrency: int = 0,
+    device_memory: Optional[int] = None,
+    max_touch_points: int = 0,
+    device_pixel_ratio: float = 0.0,
+    timezone: str = "UTC",
+    sec_ch_ua: str = "",
+    sec_ch_ua_platform: str = "",
+    sec_ch_ua_mobile: str = "",
+    sec_ch_ua_full_version_list: str = "",
+    sec_ch_ua_arch: str = "",
+    sec_ch_ua_bitness: str = "",
+    sec_ch_ua_model: Optional[str] = None,
+    sec_ch_ua_platform_version: str = "",
 ) -> Optional[str]:
     """Try the QuickJS path. Return JSON string on success, None on any failure.
 
@@ -228,6 +271,22 @@ def get_sentinel_token_via_quickjs(
             if tag and tag not in languages:
                 languages.append(tag)
 
+    ua_lower = (user_agent or "").lower()
+    if not platform:
+        if "iphone" in ua_lower:
+            platform = "iPhone"
+        elif "mac" in ua_lower:
+            platform = "MacIntel"
+        else:
+            platform = "Win32"
+    if vendor is None:
+        if "firefox" in ua_lower:
+            vendor = ""
+        elif "chrome" in ua_lower:
+            vendor = "Google Inc."
+        else:
+            vendor = "Apple Computer, Inc."
+
     env_payload = {
         "device_id": did,
         "user_agent": user_agent or "Mozilla/5.0",
@@ -235,9 +294,16 @@ def get_sentinel_token_via_quickjs(
         "screen_height": screen_h,
         "language": lang_primary,
         "languages": languages,
-        "platform": "MacIntel",
-        "vendor": "Apple Computer, Inc.",
+        "platform": platform,
+        "vendor": vendor,
+        "browser_type": browser_type or "",
+        "hardware_concurrency": int(hardware_concurrency) if hardware_concurrency else 8,
+        "max_touch_points": int(max_touch_points),
+        "device_pixel_ratio": float(device_pixel_ratio) if device_pixel_ratio else 1.0,
+        "timezone": timezone or "UTC",
     }
+    if device_memory is not None:
+        env_payload["device_memory"] = int(device_memory)
 
     try:
         sdk_file = _ensure_sdk_file(session, timeout_ms)
@@ -255,7 +321,21 @@ def get_sentinel_token_via_quickjs(
             return None
 
         challenge = _fetch_sentinel_challenge(
-            session, device_id=did, flow=flow, request_p=request_p, timeout_ms=timeout_ms,
+            session,
+            device_id=did,
+            flow=flow,
+            request_p=request_p,
+            timeout_ms=timeout_ms,
+            user_agent=user_agent,
+            accept_language=lang_full or lang_primary,
+            sec_ch_ua=sec_ch_ua,
+            sec_ch_ua_platform=sec_ch_ua_platform,
+            sec_ch_ua_mobile=sec_ch_ua_mobile,
+            sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
+            sec_ch_ua_arch=sec_ch_ua_arch,
+            sec_ch_ua_bitness=sec_ch_ua_bitness,
+            sec_ch_ua_model=sec_ch_ua_model,
+            sec_ch_ua_platform_version=sec_ch_ua_platform_version,
         )
         c_value = str(challenge.get("token") or "").strip()
         if not c_value:

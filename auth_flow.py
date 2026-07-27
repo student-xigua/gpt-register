@@ -21,7 +21,12 @@ from typing import Optional, Any
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from config import Config
-from fingerprint import generate_fingerprint, ua_for_impersonate
+from fingerprint import (
+    apply_geo_profile,
+    generate_fingerprint,
+    sync_fingerprint_for_impersonate,
+    ua_for_impersonate,
+)
 from mail_outlook import OutlookMailProvider as MailProvider
 from http_client import create_http_session, USER_AGENT
 from log_safety import redact_sensitive_text
@@ -79,6 +84,8 @@ class AuthFlow:
     ):
         self.config = config
         self._fingerprint = generate_fingerprint()
+        self._country_code = ""
+        self._geo_seed = secrets.randbits(64)
         self._ua = self._fingerprint["user_agent"]
         self._impersonate_candidates = self._fingerprint.get(
             "fallback_impersonates",
@@ -838,7 +845,7 @@ class AuthFlow:
                 logger.warning("Codex 登录推进需要 OTP，但未提供 mail_provider")
                 return continue_url or ""
             try:
-                otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "60")))
+                otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
             except Exception:
                 otp_timeout = 180
             otp_sent_at = time.time()
@@ -1505,6 +1512,7 @@ class AuthFlow:
         self._impersonate_idx += 1
         imp = self._impersonate_candidates[self._impersonate_idx]
         self._ua = ua_for_impersonate(imp, self._ua)
+        sync_fingerprint_for_impersonate(self._fingerprint, imp, self._ua)
         logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}, ua={self._ua[:60]}...")
         self.session = create_http_session(
             proxy=self.config.proxy, impersonate=imp, user_agent=self._ua,
@@ -1569,6 +1577,16 @@ class AuthFlow:
             headers["sec-ch-ua"] = fp["sec_ch_ua"]
             headers["sec-ch-ua-mobile"] = fp.get("sec_ch_ua_mobile") or "?0"
             headers["sec-ch-ua-platform"] = fp["sec_ch_ua_platform"]
+            for fp_key, header_name in (
+                ("sec_ch_ua_full_version_list", "sec-ch-ua-full-version-list"),
+                ("sec_ch_ua_arch", "sec-ch-ua-arch"),
+                ("sec_ch_ua_bitness", "sec-ch-ua-bitness"),
+                ("sec_ch_ua_model", "sec-ch-ua-model"),
+                ("sec_ch_ua_platform_version", "sec-ch-ua-platform-version"),
+            ):
+                value = fp.get(fp_key)
+                if value is not None and value != "":
+                    headers[header_name] = value
 
         # auth.openai.com 侧请求补设备标识（若可得）
         try:
@@ -1591,8 +1609,23 @@ class AuthFlow:
             if resp.status_code == 200:
                 loc = re.search(r"loc=(\w+)", resp.text)
                 ip = re.search(r"ip=([^\n]+)", resp.text)
+                country_code = (loc.group(1) if loc else "").upper()
                 logger.info(f"网络正常 - IP: {ip.group(1) if ip else 'N/A'}, "
-                            f"地区: {loc.group(1) if loc else 'N/A'}")
+                            f"地区: {country_code or 'N/A'}")
+                if country_code and country_code != self._country_code:
+                    # 只联动语言/时区；已建立的 TLS、UA、浏览器与硬件画像保持不变。
+                    apply_geo_profile(
+                        self._fingerprint,
+                        country_code,
+                        random.Random(f"{self._geo_seed}:{country_code}"),
+                    )
+                    self._country_code = country_code
+                    logger.info(
+                        "地理指纹已联动: country=%s timezone=%s language=%s",
+                        country_code,
+                        self._fingerprint.get("timezone", "UTC"),
+                        self._fingerprint.get("lang", "en-US"),
+                    )
             else:
                 logger.warning(f"网络探测异常: cloudflare trace {resp.status_code}")
 
@@ -1723,6 +1756,32 @@ class AuthFlow:
         return device_id
 
     # ── Step 5: 获取 Sentinel Token ──
+    def _sentinel_fp_kwargs(self) -> dict:
+        """让 Sentinel 的 HTTP、QuickJS 与纯 Python 路径复用同一套画像。"""
+        fp = self._fingerprint or {}
+        return {
+            "user_agent": self._ua,
+            "sec_ch_ua": fp.get("sec_ch_ua", ""),
+            "sec_ch_ua_platform": fp.get("sec_ch_ua_platform", ""),
+            "sec_ch_ua_mobile": fp.get("sec_ch_ua_mobile", ""),
+            "sec_ch_ua_full_version_list": fp.get("sec_ch_ua_full_version_list", ""),
+            "sec_ch_ua_arch": fp.get("sec_ch_ua_arch", ""),
+            "sec_ch_ua_bitness": fp.get("sec_ch_ua_bitness", ""),
+            "sec_ch_ua_model": fp.get("sec_ch_ua_model"),
+            "sec_ch_ua_platform_version": fp.get("sec_ch_ua_platform_version", ""),
+            "screen": fp.get("screen", ""),
+            "lang": fp.get("lang", ""),
+            "lang_full": fp.get("lang_full", ""),
+            "timezone": fp.get("timezone", "UTC"),
+            "browser_type": fp.get("browser_type", ""),
+            "navigator_platform": fp.get("navigator_platform", ""),
+            "navigator_vendor": fp.get("navigator_vendor"),
+            "hardware_concurrency": fp.get("hardware_concurrency", 0),
+            "device_memory": fp.get("device_memory"),
+            "max_touch_points": fp.get("max_touch_points", 0),
+            "device_pixel_ratio": fp.get("device_pixel_ratio", 0.0),
+        }
+
     def get_sentinel_token(self, device_id: str) -> str:
         logger.info("[4/10] 获取 Sentinel Token (PoW)...")
         from sentinel import get_sentinel_token
@@ -1730,13 +1789,7 @@ class AuthFlow:
             self.session,
             device_id=device_id,
             flow="authorize_continue",
-            user_agent=self._ua,
-            sec_ch_ua=self._fingerprint["sec_ch_ua"],
-            sec_ch_ua_platform=self._fingerprint.get("sec_ch_ua_platform", ""),
-            sec_ch_ua_mobile=self._fingerprint.get("sec_ch_ua_mobile", ""),
-            screen=self._fingerprint["screen"],
-            lang=self._fingerprint["lang"],
-            lang_full=self._fingerprint["lang_full"],
+            **self._sentinel_fp_kwargs(),
         )
         self._last_sentinel_token = token or ""
         logger.debug("Sentinel Token 获取成功")
@@ -1870,7 +1923,8 @@ class AuthFlow:
             try:
                 from sentinel import get_sentinel_token as _get_st
                 token = _get_st(self.session, device_id=self.result.device_id,
-                                flow="username_password_create")
+                                flow="username_password_create",
+                                **self._sentinel_fp_kwargs())
                 self._last_sentinel_token = token or ""
                 logger.debug("Sentinel Token 获取成功")
             except Exception as e:
@@ -2054,7 +2108,8 @@ class AuthFlow:
             try:
                 from sentinel import get_sentinel_token as _get_st
                 token = _get_st(self.session, device_id=self.result.device_id,
-                                flow="create_account")
+                                flow="create_account",
+                                **self._sentinel_fp_kwargs())
                 self._last_sentinel_token = token or ""
                 logger.debug("Sentinel Token 获取成功")
             except Exception as e:
@@ -2811,7 +2866,7 @@ class AuthFlow:
                     self.send_otp()
 
             try:
-                otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "60")))
+                otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
             except Exception:
                 otp_timeout = 180
             otp_code = mail_provider.wait_for_otp(
@@ -2861,7 +2916,7 @@ class AuthFlow:
             continue_url = ""
 
             try:
-                otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "60")))
+                otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
             except Exception:
                 otp_timeout = 180
 
@@ -3082,7 +3137,7 @@ class AuthFlow:
 
         continue_url = ""
         try:
-            otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "60")))
+            otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
         except Exception:
             otp_timeout = 180
 

@@ -540,7 +540,7 @@ def _login_existing_for_rt(
         emit("email_otp", "已发出验证码，正在从 Outlook 邮箱读取", status="running")
         code = original_wait(
             target_email,
-            timeout=max(30, min(int(otp_timeout), 600)),
+            timeout=max(10, min(int(otp_timeout), 600)),
             issued_after=issued_after,
         )
         emit("email_otp", "邮箱验证码读取成功", status="success")
@@ -773,7 +773,7 @@ def _reauth_web_session_for_2fa(
     emit("email_otp", "重认证验证码已发出，正在从 Outlook 邮箱读取", status="running")
     code = mail.wait_for_otp(
         email,
-        timeout=max(30, min(int(otp_timeout), 600)),
+        timeout=max(10, min(int(otp_timeout), 600)),
         issued_after=issued_after,
     )
     emit("email_otp", "邮箱验证码读取成功", status="success")

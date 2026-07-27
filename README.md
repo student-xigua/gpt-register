@@ -10,7 +10,7 @@
 
 含轻量级 **WebUI**：批量导入号池、可视化触发注册、实时 SSE 日志、凭证一键复制。
 **邮箱来源支持双模式**：Outlook 接码池 + CF Worker 自建 catch-all（`cloudflare_temp_email`）。
-不含支付、daemon、Camoufox、Playwright。
+不执行实际支付或成功回调；Kakao/UPI 功能只生成待支付跳转链接。项目不含 daemon、Camoufox、Playwright。
 
 ## 📰 最近更新（2026-07）
 
@@ -33,6 +33,12 @@
 - 🩺 **错误分类 + 熔断**：网络错误自动 release 号；连续 3 次网络错误自动暂停 + 红色横幅
 - 📦 **批量操作**：批量删除号池/凭证 + 按状态批量删
 - ✅ **session_token 三路兜底**：cookie / JSON / domain-free，新号也能拿到
+
+### Kakao 提链代理职责
+
+- **代理池1（KR checkout/provider）**：负责 OpenAI checkout、Stripe 初始化、OpenAI/Stripe 税务同步、Kakao `pre_confirm`、payment method、confirm、approve、轮询和最终 Kakao/Nicepay 跳转。执行前校验实际出口为韩国 `KR`。
+- **代理池2（VN promotion）**：只负责 OpenAI `checkout/update` 促销压价，执行前校验实际出口为越南 `VN`；留空时由代理池1中的代理通过 `country/region` 选择器派生 VN 出口。
+- Kakao checkout 必须同时满足 `kakao_pay`、`0 KRW`，最终链接必须跳转到 Kakao/Nicepay 主机；程序不会访问支付成功回调，也不会继续完成支付。
 
 ## 🎀 两种使用方式
 

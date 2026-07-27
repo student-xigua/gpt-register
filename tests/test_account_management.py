@@ -383,14 +383,14 @@ class TwoFactorTests(TempDatabaseTest):
             mock.patch.object(account_ops, "OutlookMailProvider") as provider,
         ):
             provider.return_value.wait_for_otp.return_value = "123456"
-            secret = account_ops._bind_two_factor("person@example.com", otp_timeout=60)
+            secret = account_ops._bind_two_factor("person@example.com", otp_timeout=10)
 
         self.assertEqual(secret, self.SECRET)
         validate.assert_called_once_with(self.flow, "123456")
         activate.assert_called_once_with(self.flow, "reauth-web-at", self.SECRET, "sess-2")
         self.assertEqual(provider.call_args.kwargs["client_id"], "client-id")
         self.assertEqual(
-            provider.return_value.wait_for_otp.call_args.kwargs["timeout"], 60
+            provider.return_value.wait_for_otp.call_args.kwargs["timeout"], 10
         )
         self.assertEqual(db.get_registered("person@example.com")["totp_secret"], self.SECRET)
 
@@ -542,6 +542,55 @@ class PlanFilterTests(TempDatabaseTest):
             self.assertEqual(db.registered_summary()["plus"], 1)
         finally:
             db.DB_PATH = original
+
+
+class UsageStatusTests(TempDatabaseTest):
+    def seed(self, email: str, status: str):
+        self.save(email)
+        db.update_plus_check(email, {"status": status, "label": status, "checked_at": 1.0})
+
+    def test_mark_used_only_updates_detected_plus_accounts_in_mixed_batch(self):
+        statuses = {
+            "active@example.com": "plus_active",
+            "promo@example.com": "plus_promo",
+            "trial@example.com": "plus_eligible",
+            "free@example.com": "free",
+        }
+        for email, status in statuses.items():
+            self.seed(email, status)
+        self.save("unchecked@example.com")
+
+        response = app.api_mark_used(
+            app.MarkUsedReq(emails=[*statuses, "unchecked@example.com"])
+        )
+
+        self.assertEqual(response, {"ok": True, "marked": 3})
+        for email in ("active@example.com", "promo@example.com", "trial@example.com"):
+            self.assertIsNotNone(db.get_registered(email)["used_at"])
+        self.assertIsNone(db.get_registered("free@example.com")["used_at"])
+        self.assertIsNone(db.get_registered("unchecked@example.com")["used_at"])
+
+        used = app.api_registered(filter="used")
+        self.assertEqual(used["summary"]["used"], 3)
+        self.assertEqual(
+            {item["email"] for item in used["items"]},
+            {"active@example.com", "promo@example.com", "trial@example.com"},
+        )
+
+    def test_copy_email_frontend_marks_only_after_clipboard_write_succeeds(self):
+        source = (Path(app.__file__).parent / "static" / "accounts.js").read_text(
+            encoding="utf-8"
+        )
+        start = source.index("async function copySourceEmails")
+        end = source.index("\nasync function copyTwoFactor", start)
+        copy_source_emails = source[start:end]
+
+        self.assertIn("copiedEmails.push(email);", copy_source_emails)
+        self.assertIn("await markUsed(copiedEmails);", copy_source_emails)
+        self.assertGreater(
+            copy_source_emails.index("await markUsed(copiedEmails);"),
+            copy_source_emails.index('await copyText(values.join("\\n"));'),
+        )
 
 
 class LogSafetyTests(unittest.TestCase):

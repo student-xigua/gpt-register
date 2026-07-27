@@ -57,7 +57,7 @@
         <input id="regProxy" placeholder="socks5://user:pass@host:1080">
       </label>
       <label>OTP 等待秒数
-        <input id="regOtpTimeout" type="number" value="180" min="30" max="600">
+        <input id="regOtpTimeout" type="number" value="180" min="10" max="600">
       </label>
 
       <div class="row">
@@ -76,6 +76,9 @@
         </label>
         <label class="check inline-check" title="每个 worker 跑完一个号的冷却（防风控）">
           冷却:<input id="autoCoolDown" type="number" value="3" min="0" max="120" style="width:60px;display:inline-block;margin-left:4px"> 秒
+        </label>
+        <label class="check inline-check" title="累计成功达到目标后自动停止；0 表示不限量">
+          目标:<input id="autoTargetCount" type="number" value="0" min="0" max="100000" step="1" required style="width:70px;display:inline-block;margin-left:4px"> 个
         </label>
       </div>
       <div class="row">
@@ -453,17 +456,17 @@
         每行一个代理，运行时随机取一条。格式：<code>host:port:user:pass</code> 或 <code>http://user:pass@host:port</code>。
       </p>
       <div class="form">
-        <label>代理池1 <small>（账单出口 · 韩国 KR 住宅，必填）</small>
+        <label>代理池1 <small>（KR checkout/provider · 韩国住宅，必填）</small>
           <textarea id="kakao_pool1" rows="4" placeholder="host:port:user:pass&#10;每行一个韩国住宅代理" style="font-family:monospace;font-size:12px"></textarea>
         </label>
         <p class="hint" style="margin:-4px 0 8px">
-          👉 代理池1 跑 <b>OpenAI checkout + Stripe 初始化</b>，决定账单/风控出口国家——Kakao Pay 需走韩国 KR 才会出现该付款方式。
+          👉 代理池1 固定跑 <b>KR checkout/provider</b>：OpenAI checkout、Stripe 初始化、税务同步、Kakao payment method、confirm、approve、轮询与最终跳转；执行前会校验实际出口为 KR。
         </p>
-        <label>代理池2 <small>（压价出口，留空则复用代理池1）</small>
-          <textarea id="kakao_pool2" rows="4" placeholder="host:port:user:pass&#10;每行一个压价出口代理（可留空）" style="font-family:monospace;font-size:12px"></textarea>
+        <label>代理池2 <small>（VN promotion · 越南出口，留空则由池1代理派生）</small>
+          <textarea id="kakao_pool2" rows="4" placeholder="host:port:user:pass&#10;每行一个越南 VN 促销出口代理（可留空）" style="font-family:monospace;font-size:12px"></textarea>
         </label>
         <p class="hint" style="margin:-4px 0 8px">
-          👉 代理池2 跑 <b>checkout/update 促销压价</b>这一步；换付款方式 / 确认 / 轮询取链接会在池1、池2之间轮流尝试。
+          👉 代理池2 只跑 <b>VN checkout/update 促销压价</b>；其余阶段不会使用池2。代理包含 <code>country/region</code> 选择器时会强制改写为 VN，并校验实际出口。
         </p>
         <div class="row">
           <button id="btnSaveKakaoCfg" class="primary">💾 保存配置</button>
@@ -487,6 +490,6 @@
   </div>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20260727-666ddbf-2"></script>
 </body>
 </html>

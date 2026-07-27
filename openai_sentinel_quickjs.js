@@ -220,15 +220,25 @@ function installRuntime(payload) {
   globalThis.top = globalThis;
   globalThis.parent = globalThis;
   globalThis.document = document;
+  const navPlatform =
+    payload.platform != null ? String(payload.platform) : "MacIntel";
+  const navVendor =
+    payload.vendor != null ? String(payload.vendor) : "Apple Computer, Inc.";
   globalThis.navigator = {
     userAgent: String(payload.user_agent || "Mozilla/5.0"),
     language: String(payload.language || "en-US"),
     languages: Array.isArray(payload.languages) ? payload.languages : ["en-US", "en"],
     hardwareConcurrency: Number(payload.hardware_concurrency || 8),
-    platform: String(payload.platform || "MacIntel"),
-    vendor: String(payload.vendor || "Apple Computer, Inc."),
+    platform: navPlatform,
+    vendor: navVendor,
+    maxTouchPoints: Number(payload.max_touch_points || 0),
     webdriver: false,
   };
+  // deviceMemory 只有 Chromium 暴露；Safari/Firefox 保持 undefined。
+  if (payload.device_memory != null && !Number.isNaN(Number(payload.device_memory))) {
+    globalThis.navigator.deviceMemory = Number(payload.device_memory);
+  }
+  globalThis.devicePixelRatio = Number(payload.device_pixel_ratio || 1);
   globalThis.location = {
     href: "https://auth.openai.com/",
     origin: "https://auth.openai.com",
@@ -241,6 +251,29 @@ function installRuntime(payload) {
   globalThis.sessionStorage = createStorage();
   globalThis.__sentinel_init_pending = [];
   globalThis.__sentinel_token_pending = [];
+
+  // 让 SDK 看到的 Intl 时区与出口 IP 画像一致，同时保留原构造器原型。
+  const targetTimezone = String(payload.timezone || "UTC");
+  const DateTimeFormatOriginal = globalThis.Intl && globalThis.Intl.DateTimeFormat;
+  if (DateTimeFormatOriginal) {
+    const DateTimeFormatPatched = function (locales, options) {
+      const normalized = options ? { ...options } : {};
+      if (!Object.prototype.hasOwnProperty.call(normalized, "timeZone")) {
+        normalized.timeZone = targetTimezone;
+      }
+      const instance = new DateTimeFormatOriginal(locales, normalized);
+      const originalResolvedOptions = instance.resolvedOptions.bind(instance);
+      instance.resolvedOptions = function () {
+        const resolved = originalResolvedOptions();
+        resolved.timeZone = targetTimezone;
+        return resolved;
+      };
+      return instance;
+    };
+    Object.setPrototypeOf(DateTimeFormatPatched, DateTimeFormatOriginal);
+    DateTimeFormatPatched.prototype = DateTimeFormatOriginal.prototype;
+    globalThis.Intl.DateTimeFormat = DateTimeFormatPatched;
+  }
 
   globalThis.setTimeout = (cb) => {
     if (typeof cb === "function") cb();

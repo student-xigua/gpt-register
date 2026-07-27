@@ -181,6 +181,10 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--blue); }
 .icon-action svg { width: 13px; }
 .text-action { height: 27px; padding: 0 7px; font-size: 10px; }
 .text-action.bound { color: var(--green); border-color: #bcdccc; background: #f3fbf7; }
+.text-action.expired { color: #a45b18; border-color: #e8c69d; background: #fff8ef; }
+.link-actions { display: inline-flex; align-items: center; gap: 2px; }
+.link-refresh { width: 24px; flex-basis: 24px; }
+.link-refresh svg { width: 12px; }
 
 .table-footer { flex: 0 0 39px; display: flex; align-items: center; padding: 4px 8px; border-top: 1px solid var(--line); background: var(--surface-muted); }
 .pager { margin-left: auto; display: flex; align-items: center; gap: 7px; }

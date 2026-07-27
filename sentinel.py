@@ -27,7 +27,8 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,34 @@ DEFAULT_UA = (
 DEFAULT_SEC_CH_UA = (
     '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"'
 )
+
+# Windows 精简 Python 环境可能没有系统 tzdata；这些常见出口的固定偏移只作
+# 纯 Python Sentinel 兜底，Linux/完整 Python 仍优先使用 ZoneInfo（含 DST）。
+_FALLBACK_TZ_HOURS = {
+    "Asia/Tokyo": 9, "Asia/Seoul": 9, "Asia/Shanghai": 8,
+    "Asia/Hong_Kong": 8, "Asia/Taipei": 8, "Asia/Singapore": 8,
+    "Asia/Kuala_Lumpur": 8, "Asia/Bangkok": 7, "Asia/Ho_Chi_Minh": 7,
+    "Asia/Manila": 8, "Asia/Jakarta": 7, "Asia/Kolkata": 5.5,
+    "Asia/Karachi": 5, "Asia/Yekaterinburg": 5, "Asia/Novosibirsk": 7,
+    "Asia/Dhaka": 6, "Asia/Jerusalem": 2, "Europe/Istanbul": 3,
+    "Asia/Riyadh": 3, "Asia/Dubai": 4, "Europe/London": 0,
+    "Europe/Berlin": 1, "Europe/Paris": 1, "Europe/Rome": 1,
+    "Europe/Madrid": 1, "Europe/Amsterdam": 1, "Europe/Brussels": 1,
+    "Europe/Zurich": 1, "Europe/Stockholm": 1, "Europe/Oslo": 1,
+    "Europe/Copenhagen": 1, "Europe/Helsinki": 2, "Europe/Warsaw": 1,
+    "Europe/Moscow": 3, "Europe/Kyiv": 2, "Europe/Prague": 1,
+    "Europe/Vienna": 1, "Europe/Athens": 2, "Europe/Lisbon": 0,
+    "America/New_York": -5, "America/Los_Angeles": -8,
+    "America/Chicago": -6, "America/Denver": -7, "America/Toronto": -5,
+    "America/Vancouver": -8, "America/Edmonton": -7,
+    "America/Mexico_City": -6, "America/Sao_Paulo": -3,
+    "America/Manaus": -4, "America/Fortaleza": -3,
+    "America/Argentina/Buenos_Aires": -3, "America/Santiago": -4,
+    "America/Bogota": -5, "Australia/Sydney": 10,
+    "Australia/Melbourne": 10, "Australia/Brisbane": 10,
+    "Pacific/Auckland": 12, "Africa/Johannesburg": 2,
+    "Africa/Cairo": 2, "Africa/Lagos": 1, "Africa/Nairobi": 3,
+}
 
 
 class SentinelTokenGenerator:
@@ -63,12 +92,43 @@ class SentinelTokenGenerator:
         screen: str = "",
         lang: str = "",
         lang_full: str = "",
+        browser_type: str = "",
+        navigator_platform: str = "",
+        navigator_vendor: str | None = None,
+        hardware_concurrency: int = 0,
+        device_memory: int | None = None,
+        max_touch_points: int = 0,
+        device_pixel_ratio: float = 0.0,
+        timezone_name: str = "UTC",
     ):
         self.device_id = device_id or str(uuid.uuid4())
         self.user_agent = user_agent or DEFAULT_UA
         self.screen = screen or "1920x1080"
         self.lang = lang or "en-US"
         self.lang_full = lang_full or "en-US,en"
+        ua_lower = self.user_agent.lower()
+        if not navigator_platform:
+            if "iphone" in ua_lower:
+                navigator_platform = "iPhone"
+            elif "mac" in ua_lower:
+                navigator_platform = "MacIntel"
+            else:
+                navigator_platform = "Win32"
+        if navigator_vendor is None:
+            if "firefox" in ua_lower:
+                navigator_vendor = ""
+            elif "chrome" in ua_lower:
+                navigator_vendor = "Google Inc."
+            else:
+                navigator_vendor = "Apple Computer, Inc."
+        self.browser_type = browser_type or ""
+        self.navigator_platform = navigator_platform
+        self.navigator_vendor = navigator_vendor
+        self.hardware_concurrency = int(hardware_concurrency) if hardware_concurrency else 8
+        self.device_memory = device_memory
+        self.max_touch_points = int(max_touch_points)
+        self.device_pixel_ratio = float(device_pixel_ratio) if device_pixel_ratio else 1.0
+        self.timezone_name = timezone_name or "UTC"
         self.requirements_seed = str(random.random())
         self.sid = str(uuid.uuid4())
 
@@ -86,17 +146,41 @@ class SentinelTokenGenerator:
         return format(h & 0xFFFFFFFF, "08x")
 
     def _get_config(self) -> list:
-        now = datetime.now(timezone.utc)
-        date_str = now.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
+        try:
+            now = datetime.now(ZoneInfo(self.timezone_name))
+            offset = now.strftime("%z") or "+0000"
+            date_str = now.strftime("%a %b %d %Y %H:%M:%S") + f" GMT{offset} ({self.timezone_name})"
+        except Exception:
+            hours = _FALLBACK_TZ_HOURS.get(self.timezone_name, 0)
+            now = datetime.now(timezone.utc) + timedelta(hours=hours)
+            sign = "+" if hours >= 0 else "-"
+            absolute_minutes = int(abs(hours) * 60)
+            offset = f"{sign}{absolute_minutes // 60:02d}{absolute_minutes % 60:02d}"
+            date_str = now.strftime("%a %b %d %Y %H:%M:%S") + f" GMT{offset} ({self.timezone_name})"
         perf_now = random.uniform(1000, 50000)
         time_origin = time.time() * 1000 - perf_now
-        nav_prop = random.choice([
-            "vendorSub", "productSub", "vendor", "maxTouchPoints",
-            "userActivation", "doNotTrack", "geolocation",
-            "plugins", "mimeTypes", "pdfViewerEnabled",
-            "hardwareConcurrency", "cookieEnabled", "credentials",
-            "mediaDevices", "permissions", "locks",
-        ])
+        nav_props = [
+            ("vendorSub", ""),
+            ("productSub", "20030107"),
+            ("vendor", self.navigator_vendor),
+            ("platform", self.navigator_platform),
+            ("maxTouchPoints", str(self.max_touch_points)),
+            ("hardwareConcurrency", str(self.hardware_concurrency)),
+            ("cookieEnabled", "true"),
+            ("doNotTrack", random.choice(("null", "1", "unspecified"))),
+            ("pdfViewerEnabled", "true" if self.navigator_vendor == "Google Inc." else "false"),
+            ("userActivation", "undefined"),
+            ("geolocation", "undefined"),
+            ("plugins", "undefined"),
+            ("mimeTypes", "undefined"),
+            ("credentials", "undefined"),
+            ("mediaDevices", "undefined"),
+            ("permissions", "undefined"),
+            ("locks", "undefined"),
+        ]
+        if self.device_memory is not None:
+            nav_props.append(("deviceMemory", str(self.device_memory)))
+        nav_prop, nav_value = random.choice(nav_props)
         return [
             self.screen,
             date_str,
@@ -109,13 +193,13 @@ class SentinelTokenGenerator:
             self.lang,
             self.lang_full,
             random.random(),
-            f"{nav_prop}−undefined",
+            f"{nav_prop}−{nav_value}",
             random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
             random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            self.hardware_concurrency,
             time_origin,
         ]
 
@@ -159,16 +243,37 @@ def fetch_sentinel_challenge(
     sec_ch_ua: str | None = None,
     sec_ch_ua_platform: str = "",
     sec_ch_ua_mobile: str = "",
+    sec_ch_ua_full_version_list: str = "",
+    sec_ch_ua_arch: str = "",
+    sec_ch_ua_bitness: str = "",
+    sec_ch_ua_model: str | None = None,
+    sec_ch_ua_platform_version: str = "",
     impersonate: str | None = None,
     request_p: str | None = None,
     screen: str = "",
     lang: str = "",
     lang_full: str = "",
+    browser_type: str = "",
+    navigator_platform: str = "",
+    navigator_vendor: str | None = None,
+    hardware_concurrency: int = 0,
+    device_memory: int | None = None,
+    max_touch_points: int = 0,
+    device_pixel_ratio: float = 0.0,
+    timezone_name: str = "UTC",
 ) -> dict | None:
     """POST `/sentinel/req` 并返回响应 JSON。失败返回 None。"""
     generator = SentinelTokenGenerator(
         device_id=device_id, user_agent=user_agent,
         screen=screen, lang=lang, lang_full=lang_full,
+        browser_type=browser_type,
+        navigator_platform=navigator_platform,
+        navigator_vendor=navigator_vendor,
+        hardware_concurrency=hardware_concurrency,
+        device_memory=device_memory,
+        max_touch_points=max_touch_points,
+        device_pixel_ratio=device_pixel_ratio,
+        timezone_name=timezone_name,
     )
     req_body = {
         "p": str(request_p or "").strip() or generator.generate_requirements_token(),
@@ -190,6 +295,15 @@ def fetch_sentinel_challenge(
         headers["sec-ch-ua"] = sec_ch_ua
         headers["sec-ch-ua-mobile"] = sec_ch_ua_mobile or "?0"
         headers["sec-ch-ua-platform"] = sec_ch_ua_platform or '"Windows"'
+        for value, header_name in (
+            (sec_ch_ua_full_version_list, "sec-ch-ua-full-version-list"),
+            (sec_ch_ua_arch, "sec-ch-ua-arch"),
+            (sec_ch_ua_bitness, "sec-ch-ua-bitness"),
+            (sec_ch_ua_model, "sec-ch-ua-model"),
+            (sec_ch_ua_platform_version, "sec-ch-ua-platform-version"),
+        ):
+            if value is not None and value != "":
+                headers[header_name] = value
     kwargs = {"data": json.dumps(req_body), "headers": headers, "timeout": 20}
     if impersonate:
         kwargs["impersonate"] = impersonate
@@ -212,10 +326,23 @@ def build_sentinel_token(
     sec_ch_ua: str | None = None,
     sec_ch_ua_platform: str = "",
     sec_ch_ua_mobile: str = "",
+    sec_ch_ua_full_version_list: str = "",
+    sec_ch_ua_arch: str = "",
+    sec_ch_ua_bitness: str = "",
+    sec_ch_ua_model: str | None = None,
+    sec_ch_ua_platform_version: str = "",
     impersonate: str | None = None,
     screen: str = "",
     lang: str = "",
     lang_full: str = "",
+    browser_type: str = "",
+    navigator_platform: str = "",
+    navigator_vendor: str | None = None,
+    hardware_concurrency: int = 0,
+    device_memory: int | None = None,
+    max_touch_points: int = 0,
+    device_pixel_ratio: float = 0.0,
+    timezone_name: str = "UTC",
 ) -> str | None:
     """完整 Sentinel token：fetch challenge → 用 server-given seed/difficulty 解 PoW → 拼装。
 
@@ -229,10 +356,23 @@ def build_sentinel_token(
         sec_ch_ua=sec_ch_ua,
         sec_ch_ua_platform=sec_ch_ua_platform,
         sec_ch_ua_mobile=sec_ch_ua_mobile,
+        sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
+        sec_ch_ua_arch=sec_ch_ua_arch,
+        sec_ch_ua_bitness=sec_ch_ua_bitness,
+        sec_ch_ua_model=sec_ch_ua_model,
+        sec_ch_ua_platform_version=sec_ch_ua_platform_version,
         impersonate=impersonate,
         screen=screen,
         lang=lang,
         lang_full=lang_full,
+        browser_type=browser_type,
+        navigator_platform=navigator_platform,
+        navigator_vendor=navigator_vendor,
+        hardware_concurrency=hardware_concurrency,
+        device_memory=device_memory,
+        max_touch_points=max_touch_points,
+        device_pixel_ratio=device_pixel_ratio,
+        timezone_name=timezone_name,
     )
     if not challenge:
         return None
@@ -245,6 +385,14 @@ def build_sentinel_token(
     generator = SentinelTokenGenerator(
         device_id=device_id, user_agent=user_agent,
         screen=screen, lang=lang, lang_full=lang_full,
+        browser_type=browser_type,
+        navigator_platform=navigator_platform,
+        navigator_vendor=navigator_vendor,
+        hardware_concurrency=hardware_concurrency,
+        device_memory=device_memory,
+        max_touch_points=max_touch_points,
+        device_pixel_ratio=device_pixel_ratio,
+        timezone_name=timezone_name,
     )
     pow_data = challenge.get("proofofwork") or {}
     if pow_data.get("required") and pow_data.get("seed"):
@@ -273,9 +421,22 @@ def get_sentinel_token(
     sec_ch_ua: str = "",
     sec_ch_ua_platform: str = "",
     sec_ch_ua_mobile: str = "",
+    sec_ch_ua_full_version_list: str = "",
+    sec_ch_ua_arch: str = "",
+    sec_ch_ua_bitness: str = "",
+    sec_ch_ua_model: str | None = None,
+    sec_ch_ua_platform_version: str = "",
     screen: str = "",
     lang: str = "",
     lang_full: str = "",
+    browser_type: str = "",
+    navigator_platform: str = "",
+    navigator_vendor: str | None = None,
+    hardware_concurrency: int = 0,
+    device_memory: int | None = None,
+    max_touch_points: int = 0,
+    device_pixel_ratio: float = 0.0,
+    timezone: str = "UTC",
 ) -> str:
     """auth_flow.py 复用的入口；返回 JSON 字符串，永远不抛异常。
 
@@ -302,6 +463,22 @@ def get_sentinel_token(
                 screen=screen,
                 lang=lang,
                 lang_full=lang_full,
+                browser_type=browser_type,
+                platform=navigator_platform,
+                vendor=navigator_vendor,
+                hardware_concurrency=hardware_concurrency,
+                device_memory=device_memory,
+                max_touch_points=max_touch_points,
+                device_pixel_ratio=device_pixel_ratio,
+                timezone=timezone,
+                sec_ch_ua=sec_ch_ua,
+                sec_ch_ua_platform=sec_ch_ua_platform,
+                sec_ch_ua_mobile=sec_ch_ua_mobile,
+                sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
+                sec_ch_ua_arch=sec_ch_ua_arch,
+                sec_ch_ua_bitness=sec_ch_ua_bitness,
+                sec_ch_ua_model=sec_ch_ua_model,
+                sec_ch_ua_platform_version=sec_ch_ua_platform_version,
             )
             if qtoken:
                 return qtoken
@@ -317,9 +494,22 @@ def get_sentinel_token(
         sec_ch_ua=sec_ch_ua,
         sec_ch_ua_platform=sec_ch_ua_platform,
         sec_ch_ua_mobile=sec_ch_ua_mobile,
+        sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
+        sec_ch_ua_arch=sec_ch_ua_arch,
+        sec_ch_ua_bitness=sec_ch_ua_bitness,
+        sec_ch_ua_model=sec_ch_ua_model,
+        sec_ch_ua_platform_version=sec_ch_ua_platform_version,
         screen=screen,
         lang=lang,
         lang_full=lang_full,
+        browser_type=browser_type,
+        navigator_platform=navigator_platform,
+        navigator_vendor=navigator_vendor,
+        hardware_concurrency=hardware_concurrency,
+        device_memory=device_memory,
+        max_touch_points=max_touch_points,
+        device_pixel_ratio=device_pixel_ratio,
+        timezone_name=timezone,
     )
     if token:
         logger.debug(f"Sentinel Token (纯Python len={len(token)})")
@@ -329,6 +519,14 @@ def get_sentinel_token(
     fallback_p = SentinelTokenGenerator(
         device_id=device_id, user_agent=user_agent,
         screen=screen, lang=lang, lang_full=lang_full,
+        browser_type=browser_type,
+        navigator_platform=navigator_platform,
+        navigator_vendor=navigator_vendor,
+        hardware_concurrency=hardware_concurrency,
+        device_memory=device_memory,
+        max_touch_points=max_touch_points,
+        device_pixel_ratio=device_pixel_ratio,
+        timezone_name=timezone,
     ).generate_requirements_token()
     return json.dumps({
         "p": fallback_p,

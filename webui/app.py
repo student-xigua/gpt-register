@@ -366,7 +366,7 @@ def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
 class AccountEmailsReq(BaseModel):
     emails: list[str] = Field(..., min_length=1, max_length=100, description="账号邮箱列表")
     proxy: str = Field("", description="可选代理")
-    otp_timeout: int = Field(180, ge=30, le=600)
+    otp_timeout: int = Field(180, ge=10, le=600)
 
 
 @app.get("/api/account-management/email/{email}")
@@ -443,7 +443,7 @@ class MarkUsedReq(BaseModel):
 
 @app.post("/api/account-management/mark_used")
 def api_mark_used(req: MarkUsedReq):
-    """把账号标记为「已使用」：复制过 AT 或导出过 Sub2API 文件时前端调用。"""
+    """把 Plus 账号标记为「已使用」：复制 AT/邮箱或导出 Sub2API 后调用。"""
     n = db.mark_registered_used(req.emails)
     return {"ok": True, "marked": n}
 
@@ -853,6 +853,7 @@ class AutoLoopStartReq(BaseModel):
     otp_timeout: int = 180
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
+    target_count: int = Field(0, ge=0, le=100000)  # 目标成功数（0=不限量）
 
 
 @app.post("/api/auto/start")
@@ -880,8 +881,8 @@ def api_auto_resume():
 
 
 @app.post("/api/auto/stop")
-def api_auto_stop():
-    res = AUTO_LOOP.stop()
+def api_auto_stop(force: bool = False):
+    res = AUTO_LOOP.stop(force=force)
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "停止失败"))
     return res

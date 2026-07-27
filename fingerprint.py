@@ -5,8 +5,9 @@
   - User-Agent
   - sec-ch-ua / sec-ch-ua-platform / sec-ch-ua-mobile（仅 Chrome）
   - 屏幕分辨率
-  - Accept-Language
+  - Accept-Language / IANA timezone（按出口 IP 国家联动）
   - browser_type 标识（mac_safari / ios_safari / chrome / firefox）
+  - navigator / 硬件画像（与浏览器家族一致）
   - fallback_impersonates 同家族回退列表
 """
 from __future__ import annotations
@@ -138,6 +139,135 @@ _WEIGHTS = [w for _, w in _BROWSER_WEIGHTS]
 
 
 # ---------------------------------------------------------------------------
+# IP 国家 → 时区 / 语言画像
+# ---------------------------------------------------------------------------
+
+_COUNTRY_PROFILES: dict[str, dict] = {
+    # 亚洲
+    "JP": {"timezones": (("Asia/Tokyo", 1.0),), "languages": ("ja-JP", "ja", "en-US", "en", "zh-CN")},
+    "CN": {"timezones": (("Asia/Shanghai", 1.0),), "languages": ("zh-CN", "zh", "en-US", "en")},
+    "HK": {"timezones": (("Asia/Hong_Kong", 1.0),), "languages": ("zh-HK", "zh-CN", "zh", "en-US", "en")},
+    "TW": {"timezones": (("Asia/Taipei", 1.0),), "languages": ("zh-TW", "zh", "en-US", "en", "ja")},
+    "KR": {"timezones": (("Asia/Seoul", 1.0),), "languages": ("ko-KR", "ko", "en-US", "en", "ja")},
+    "SG": {"timezones": (("Asia/Singapore", 1.0),), "languages": ("zh-CN", "zh", "en-US", "en", "ms-MY", "ms")},
+    "MY": {"timezones": (("Asia/Kuala_Lumpur", 1.0),), "languages": ("ms-MY", "ms", "zh-CN", "zh", "en-US", "en")},
+    "TH": {"timezones": (("Asia/Bangkok", 1.0),), "languages": ("th-TH", "th", "en-US", "en")},
+    "VN": {"timezones": (("Asia/Ho_Chi_Minh", 1.0),), "languages": ("vi-VN", "vi", "en-US", "en")},
+    "IN": {"timezones": (("Asia/Kolkata", 1.0),), "languages": ("en-IN", "en-US", "en", "hi-IN", "hi")},
+    "ID": {"timezones": (("Asia/Jakarta", 1.0),), "languages": ("id-ID", "id", "en-US", "en")},
+    "PH": {"timezones": (("Asia/Manila", 1.0),), "languages": ("en-US", "en", "tl-PH", "tl")},
+    "PK": {"timezones": (("Asia/Karachi", 1.0),), "languages": ("en-US", "en", "ur-PK", "ur")},
+    "BD": {"timezones": (("Asia/Dhaka", 1.0),), "languages": ("bn-BD", "bn", "en-US", "en")},
+    "IL": {"timezones": (("Asia/Jerusalem", 1.0),), "languages": ("he-IL", "he", "en-US", "en", "ar")},
+    "TR": {"timezones": (("Europe/Istanbul", 1.0),), "languages": ("tr-TR", "tr", "en-US", "en")},
+    "SA": {"timezones": (("Asia/Riyadh", 1.0),), "languages": ("ar-SA", "ar", "en-US", "en")},
+    "AE": {"timezones": (("Asia/Dubai", 1.0),), "languages": ("ar-AE", "ar", "en-US", "en")},
+    # 美洲
+    "US": {"timezones": (("America/New_York", 0.4), ("America/Los_Angeles", 0.3), ("America/Chicago", 0.2), ("America/Denver", 0.1)), "languages": ("en-US", "en", "es-US", "es", "zh-CN")},
+    "CA": {"timezones": (("America/Toronto", 0.6), ("America/Vancouver", 0.3), ("America/Edmonton", 0.1)), "languages": ("en-CA", "en-US", "en", "fr-CA", "fr")},
+    "MX": {"timezones": (("America/Mexico_City", 1.0),), "languages": ("es-MX", "es", "en-US", "en")},
+    "BR": {"timezones": (("America/Sao_Paulo", 0.7), ("America/Manaus", 0.2), ("America/Fortaleza", 0.1)), "languages": ("pt-BR", "pt", "en-US", "en", "es")},
+    "AR": {"timezones": (("America/Argentina/Buenos_Aires", 1.0),), "languages": ("es-AR", "es", "en-US", "en")},
+    "CL": {"timezones": (("America/Santiago", 1.0),), "languages": ("es-CL", "es", "en-US", "en")},
+    "CO": {"timezones": (("America/Bogota", 1.0),), "languages": ("es-CO", "es", "en-US", "en")},
+    # 欧洲
+    "GB": {"timezones": (("Europe/London", 1.0),), "languages": ("en-GB", "en-US", "en", "fr", "de")},
+    "DE": {"timezones": (("Europe/Berlin", 1.0),), "languages": ("de-DE", "de", "en-US", "en", "fr")},
+    "FR": {"timezones": (("Europe/Paris", 1.0),), "languages": ("fr-FR", "fr", "en-US", "en", "de")},
+    "IT": {"timezones": (("Europe/Rome", 1.0),), "languages": ("it-IT", "it", "en-US", "en", "fr")},
+    "ES": {"timezones": (("Europe/Madrid", 1.0),), "languages": ("es-ES", "es", "en-US", "en", "fr")},
+    "NL": {"timezones": (("Europe/Amsterdam", 1.0),), "languages": ("nl-NL", "nl", "en-US", "en", "de")},
+    "BE": {"timezones": (("Europe/Brussels", 1.0),), "languages": ("nl-BE", "fr-BE", "nl", "fr", "en-US", "en")},
+    "CH": {"timezones": (("Europe/Zurich", 1.0),), "languages": ("de-CH", "fr-CH", "de", "fr", "it", "en-US", "en")},
+    "SE": {"timezones": (("Europe/Stockholm", 1.0),), "languages": ("sv-SE", "sv", "en-US", "en")},
+    "NO": {"timezones": (("Europe/Oslo", 1.0),), "languages": ("nb-NO", "nb", "en-US", "en")},
+    "DK": {"timezones": (("Europe/Copenhagen", 1.0),), "languages": ("da-DK", "da", "en-US", "en")},
+    "FI": {"timezones": (("Europe/Helsinki", 1.0),), "languages": ("fi-FI", "fi", "sv", "en-US", "en")},
+    "PL": {"timezones": (("Europe/Warsaw", 1.0),), "languages": ("pl-PL", "pl", "en-US", "en")},
+    "RU": {"timezones": (("Europe/Moscow", 0.7), ("Asia/Yekaterinburg", 0.15), ("Asia/Novosibirsk", 0.15)), "languages": ("ru-RU", "ru", "en-US", "en")},
+    "UA": {"timezones": (("Europe/Kyiv", 1.0),), "languages": ("uk-UA", "uk", "ru", "en-US", "en")},
+    "CZ": {"timezones": (("Europe/Prague", 1.0),), "languages": ("cs-CZ", "cs", "en-US", "en", "de")},
+    "AT": {"timezones": (("Europe/Vienna", 1.0),), "languages": ("de-AT", "de", "en-US", "en")},
+    "GR": {"timezones": (("Europe/Athens", 1.0),), "languages": ("el-GR", "el", "en-US", "en")},
+    "PT": {"timezones": (("Europe/Lisbon", 1.0),), "languages": ("pt-PT", "pt", "en-US", "en", "es")},
+    # 大洋洲 / 非洲
+    "AU": {"timezones": (("Australia/Sydney", 0.5), ("Australia/Melbourne", 0.3), ("Australia/Brisbane", 0.2)), "languages": ("en-AU", "en-US", "en", "zh-CN", "zh")},
+    "NZ": {"timezones": (("Pacific/Auckland", 1.0),), "languages": ("en-NZ", "en-US", "en")},
+    "ZA": {"timezones": (("Africa/Johannesburg", 1.0),), "languages": ("en-ZA", "en-US", "en", "af")},
+    "EG": {"timezones": (("Africa/Cairo", 1.0),), "languages": ("ar-EG", "ar", "en-US", "en")},
+    "NG": {"timezones": (("Africa/Lagos", 1.0),), "languages": ("en-NG", "en-US", "en")},
+    "KE": {"timezones": (("Africa/Nairobi", 1.0),), "languages": ("sw-KE", "sw", "en-US", "en")},
+}
+
+
+# navigator / 硬件值按浏览器引擎绑定；同一个 fp 生命周期内不再改变。
+_HARDWARE_PROFILES = {
+    "mac_safari": {
+        "navigator_platform": "MacIntel", "navigator_vendor": "Apple Computer, Inc.",
+        "hardware_concurrency": (8, 10, 12, 16), "device_memory": (None,),
+        "max_touch_points": (0,), "device_pixel_ratio": (2.0,),
+    },
+    "ios_safari": {
+        "navigator_platform": "iPhone", "navigator_vendor": "Apple Computer, Inc.",
+        "hardware_concurrency": (4, 6), "device_memory": (None,),
+        "max_touch_points": (5,), "device_pixel_ratio": (2.0, 3.0),
+    },
+    "chrome": {
+        "navigator_platform": "Win32", "navigator_vendor": "Google Inc.",
+        "hardware_concurrency": (4, 6, 8, 12, 16, 24), "device_memory": (4, 8),
+        "max_touch_points": (0,), "device_pixel_ratio": (1.0, 1.25, 1.5),
+    },
+    "firefox": {
+        "navigator_platform": "Win32", "navigator_vendor": "",
+        "hardware_concurrency": (4, 6, 8, 12, 16), "device_memory": (None,),
+        "max_touch_points": (0,), "device_pixel_ratio": (1.0, 1.5),
+    },
+}
+
+
+def _apply_hardware_profile(fp: dict, r: random.Random) -> None:
+    profile = _HARDWARE_PROFILES.get(fp["browser_type"], _HARDWARE_PROFILES["chrome"])
+    fp["navigator_platform"] = profile["navigator_platform"]
+    fp["navigator_vendor"] = profile["navigator_vendor"]
+    fp["hardware_concurrency"] = r.choice(profile["hardware_concurrency"])
+    fp["device_memory"] = r.choice(profile["device_memory"])
+    fp["max_touch_points"] = r.choice(profile["max_touch_points"])
+    fp["device_pixel_ratio"] = r.choice(profile["device_pixel_ratio"])
+
+
+def apply_geo_profile(
+    fp: dict,
+    country_code: str,
+    rng: random.Random | None = None,
+) -> dict:
+    """只更新地理相关字段，绝不改变既有 UA/TLS/浏览器/硬件画像。"""
+    profile = _COUNTRY_PROFILES.get((country_code or "").strip().upper())
+    if not profile:
+        return fp
+
+    r = rng or random
+    timezone_items = profile["timezones"]
+    fp["timezone"] = r.choices(
+        [item[0] for item in timezone_items],
+        weights=[item[1] for item in timezone_items],
+        k=1,
+    )[0]
+
+    pool = list(profile["languages"])
+    primary = pool[0]
+    others = pool[1:]
+    r.shuffle(others)
+    count = r.randint(min(3, len(pool)), min(5, len(pool)))
+    selected = [primary, *others[: max(0, count - 1)]]
+    fp["lang"] = primary
+    fp["lang_full"] = ",".join(
+        lang if index == 0 else f"{lang};q={1.0 - index * 0.1:.1f}"
+        for index, lang in enumerate(selected)
+    )
+    return fp
+
+
+# ---------------------------------------------------------------------------
 # 指纹生成
 # ---------------------------------------------------------------------------
 
@@ -190,6 +320,11 @@ def _gen_chrome(r: random.Random) -> dict:
         f'"Google Chrome";v="{chrome["ver"]}", '
         f'{chrome["not_a_brand"]}'
     )
+    sec_ch_ua_full_version_list = (
+        f'"Chromium";v="{chrome["full_ver"]}", '
+        f'"Google Chrome";v="{chrome["full_ver"]}", '
+        f'{chrome["not_a_brand"]}'
+    )
     return {
         "browser_type": "chrome",
         "impersonate": chrome["impersonate"],
@@ -202,6 +337,11 @@ def _gen_chrome(r: random.Random) -> dict:
         "sec_ch_ua": sec_ch_ua,
         "sec_ch_ua_platform": '"Windows"',
         "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_full_version_list": sec_ch_ua_full_version_list,
+        "sec_ch_ua_arch": '"x86"',
+        "sec_ch_ua_bitness": '"64"',
+        "sec_ch_ua_model": '""',
+        "sec_ch_ua_platform_version": r.choice(('"10.0.0"', '"15.0.0"')),
         "screen": r.choice(_WIN_SCREENS),
     }
 
@@ -244,9 +384,12 @@ def generate_fingerprint(rng: random.Random | None = None) -> dict:
         sec_ch_ua: str        — Client Hints（仅 Chrome 非空）
         sec_ch_ua_platform: str
         sec_ch_ua_mobile: str
+        sec_ch_ua_full_version_list / arch / bitness / model / platform_version
         screen: str           — 屏幕分辨率 (WxH)
         lang: str             — 主语言
         lang_full: str        — 完整 Accept-Language
+        timezone: str         — IANA 时区
+        navigator_platform / navigator_vendor / hardware_concurrency / ...
     """
     r = rng or random
     browser_type = r.choices(_BROWSER_TYPES, weights=_WEIGHTS, k=1)[0]
@@ -255,6 +398,16 @@ def generate_fingerprint(rng: random.Random | None = None) -> dict:
     lang, lang_full = r.choice(_LANGUAGES)
     fp["lang"] = lang
     fp["lang_full"] = lang_full
+    fp["timezone"] = "UTC"
+    _apply_hardware_profile(fp, r)
+
+    # 非 Chromium 不发送 UA Client Hints；统一补键便于调用方安全读取。
+    if browser_type != "chrome":
+        fp.setdefault("sec_ch_ua_full_version_list", "")
+        fp.setdefault("sec_ch_ua_arch", "")
+        fp.setdefault("sec_ch_ua_bitness", "")
+        fp.setdefault("sec_ch_ua_model", None)
+        fp.setdefault("sec_ch_ua_platform_version", "")
     return fp
 
 
@@ -272,6 +425,48 @@ for c in _CHROME_VERSIONS:
     _ALL_IMPERSONATES[c["impersonate"]] = {"type": "chrome", "data": c}
 for f in _FIREFOX_VERSIONS:
     _ALL_IMPERSONATES[f["impersonate"]] = {"type": "firefox", "data": f}
+
+
+def sync_fingerprint_for_impersonate(
+    fp: dict,
+    impersonate: str,
+    user_agent: str,
+) -> dict:
+    """TLS 同家族回退时同步 UA/Client Hints，保留地理与硬件字段。"""
+    entry = _ALL_IMPERSONATES.get(impersonate)
+    if not entry:
+        return fp
+
+    browser_type, data = entry["type"], entry["data"]
+    fp["browser_type"] = browser_type
+    fp["impersonate"] = impersonate
+    fp["user_agent"] = user_agent
+    if browser_type == "chrome":
+        fp["sec_ch_ua"] = (
+            f'"Chromium";v="{data["ver"]}", '
+            f'"Google Chrome";v="{data["ver"]}", '
+            f'{data["not_a_brand"]}'
+        )
+        fp["sec_ch_ua_full_version_list"] = (
+            f'"Chromium";v="{data["full_ver"]}", '
+            f'"Google Chrome";v="{data["full_ver"]}", '
+            f'{data["not_a_brand"]}'
+        )
+        fp["sec_ch_ua_platform"] = '"Windows"'
+        fp["sec_ch_ua_mobile"] = "?0"
+        fp["sec_ch_ua_arch"] = '"x86"'
+        fp["sec_ch_ua_bitness"] = '"64"'
+        fp["sec_ch_ua_model"] = '""'
+        fp.setdefault("sec_ch_ua_platform_version", '"10.0.0"')
+    else:
+        for key in (
+            "sec_ch_ua", "sec_ch_ua_platform", "sec_ch_ua_mobile",
+            "sec_ch_ua_full_version_list", "sec_ch_ua_arch",
+            "sec_ch_ua_bitness", "sec_ch_ua_platform_version",
+        ):
+            fp[key] = ""
+        fp["sec_ch_ua_model"] = None
+    return fp
 
 
 def ua_for_impersonate(impersonate: str, current_ua: str) -> str:

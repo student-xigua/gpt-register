@@ -113,7 +113,7 @@ def init_db():
                     (status, row["email"]),
                 )
         con.commit()
-    # 老 DB migrate：used_at 标记账号是否已被人工使用（复制过 AT / 导出过 Sub2API 文件）
+    # 老 DB migrate：used_at 标记账号是否已被人工使用（复制过 AT/邮箱或导出过 Sub2API 文件）
     if "used_at" not in registered_cols:
         con.execute("ALTER TABLE registered ADD COLUMN used_at REAL")
         con.commit()
@@ -494,19 +494,20 @@ def save_registered(d: dict) -> None:
 def update_plus_check(email: str, plus_info: dict) -> None:
     """把 Plus 检查结果写入 extra_json.plus_check，并同步可直接查询的 plan_status 列。"""
     email = email.lower()
-    con = _conn()
-    cur = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,))
-    row = cur.fetchone()
-    if not row:
-        return
-    extra = {}
-    if row["extra_json"]:
-        try:
-            extra = json.loads(row["extra_json"])
-        except Exception:
-            extra = {}
-    extra["plus_check"] = plus_info
     with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT extra_json FROM registered WHERE email=?", (email,)
+        ).fetchone()
+        if not row:
+            return
+        extra = {}
+        if row["extra_json"]:
+            try:
+                extra = json.loads(row["extra_json"])
+            except Exception:
+                extra = {}
+        extra["plus_check"] = plus_info
         con.execute(
             "UPDATE registered SET extra_json=?, plan_status=? WHERE email=?",
             (
@@ -600,7 +601,7 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
 
 
 def mark_registered_used(emails: list[str]) -> int:
-    """把 Plus 账号标记为「已使用」（复制过 AT / 导出过 Sub2API 文件）。
+    """把 Plus 账号标记为「已使用」（复制过 AT/邮箱或导出过 Sub2API 文件）。
 
     只有当前 plan_status 已经是 Plus/优惠/试用 时才计入「已使用」——
     检测出 Plus 之前的导出/复制不算「使用」，Free 账号也不算。
@@ -694,20 +695,22 @@ def update_registered_link(email: str, method: str, link: str) -> None:
     method = str(method or "").strip().lower()
     if not method:
         return
-    con = _conn()
-    row = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,)).fetchone()
-    if not row:
-        return
-    extra = {}
-    if row["extra_json"]:
-        try:
-            extra = json.loads(row["extra_json"])
-        except Exception:
-            extra = {}
-    links = extra.get("links") if isinstance(extra.get("links"), dict) else {}
-    links[method] = {"link": str(link or ""), "at": time.time()}
-    extra["links"] = links
     with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT extra_json FROM registered WHERE email=?", (email,)
+        ).fetchone()
+        if not row:
+            return
+        extra = {}
+        if row["extra_json"]:
+            try:
+                extra = json.loads(row["extra_json"])
+            except Exception:
+                extra = {}
+        links = extra.get("links") if isinstance(extra.get("links"), dict) else {}
+        links[method] = {"link": str(link or ""), "at": time.time()}
+        extra["links"] = links
         con.execute(
             "UPDATE registered SET extra_json=? WHERE email=?",
             (json.dumps(extra, ensure_ascii=False), email),

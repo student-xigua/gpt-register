@@ -521,7 +521,7 @@ $("#btnCheckPlus").addEventListener("click", async () => {
       if (td) td.innerHTML = `<span class="plus-status plus-${info.status}">${info.label}</span>`;
       if (info.status === "plus_eligible" || info.status === "plus_active") plusCount++;
       else if (info.status === "banned") bannedCount++;
-      else freeCount++;
+      else if (info.status === "free") freeCount++;
     }
     $("#checkPlusResult").textContent = `完成: ${plusCount} 可用Plus, ${freeCount} Free, ${bannedCount} 封号`;
     $("#checkPlusResult").className = "result ok";
@@ -845,12 +845,37 @@ function _autoOptions() {
     want_session_token: true,
     want_refresh_token: true,
     cool_down_seconds: parseFloat($("#autoCoolDown").value || "3") || 0,
+    target_count: $("#autoTargetCount").valueAsNumber,
   };
 }
 
 async function autoStart() {
+  const targetInput = $("#autoTargetCount");
+  if (!targetInput) {
+    alert("页面资源版本不一致，请强制刷新后重试");
+    return;
+  }
+  if (!targetInput.checkValidity() || !Number.isInteger(targetInput.valueAsNumber)) {
+    targetInput.reportValidity();
+    return;
+  }
+  const options = _autoOptions();
   try {
-    await api("/api/auto/start", { method: "POST", body: JSON.stringify(_autoOptions()) });
+    const capability = await api("/api/auto/status");
+    if (!Object.prototype.hasOwnProperty.call(capability, "target_count")) {
+      throw new Error("后端版本不支持目标数量，请刷新或完成后端更新后再启动");
+    }
+    const started = await api("/api/auto/start", {
+      method: "POST",
+      body: JSON.stringify(options),
+    });
+    if (
+      !Number.isInteger(Number(started.target_count))
+      || Number(started.target_count) !== options.target_count
+    ) {
+      try { await api("/api/auto/stop?force=true", { method: "POST" }); } catch (_) {}
+      throw new Error("后端未确认目标数量，已停止本次自动任务");
+    }
   } catch (e) { alert("启动失败: " + e.message); }
 }
 async function autoCall(path) {
@@ -860,7 +885,24 @@ async function autoCall(path) {
 AUTO_BTNS.start.addEventListener("click", autoStart);
 AUTO_BTNS.pause.addEventListener("click", () => autoCall("/api/auto/pause"));
 AUTO_BTNS.resume.addEventListener("click", () => autoCall("/api/auto/resume"));
-AUTO_BTNS.stop.addEventListener("click", () => autoCall("/api/auto/stop"));
+let _autoStopRequested = false;
+AUTO_BTNS.stop.addEventListener("click", async () => {
+  let force = false;
+  if (_autoStopRequested) {
+    force = window.confirm(
+      "强制停止只会停止自动循环监控；已经启动的注册仍可能在后台完成。确定强制停止吗？",
+    );
+    if (!force) return;
+  }
+  try {
+    const result = await api(`/api/auto/stop${force ? "?force=true" : ""}`, {
+      method: "POST",
+    });
+    _autoStopRequested = !result.forced;
+  } catch (e) {
+    alert(`/api/auto/stop 失败: ${e.message}`);
+  }
+});
 
 function _renderAutoStatus(s) {
   const stateLabel = {
@@ -877,10 +919,21 @@ function _renderAutoStatus(s) {
         return `<div class="auto-worker">worker-${w.id} ▶ <code>${escapeHtml(w.email)}</code> ${dur}${px}</div>`;
       }).join("")
     : "";
-  const meta = `并发=${s.concurrency || 1}` + (s.proxy_pool_size ? ` 代理池=${s.proxy_pool_size}` : "");
+  const registeredOk = Number(s.registered_ok) || 0;
+  const targetCount = Math.max(0, Number(s.target_count) || 0);
+  const inFlight = Math.max(0, Number(s.in_flight) || 0);
+  const remaining = s.remaining == null ? null : Math.max(0, Number(s.remaining) || 0);
+  const meta = `并发=${s.concurrency || 1}`
+    + (s.proxy_pool_size ? ` 代理池=${s.proxy_pool_size}` : "")
+    + (targetCount ? ` 目标=${targetCount}` : " 目标=不限")
+    + ` 在途=${inFlight}`;
+  const okDisplay = targetCount
+    ? `<b class="ok">${registeredOk}</b> / ${targetCount} 成功`
+      + (remaining != null ? ` <span class="auto-meta">(剩 ${remaining})</span>` : "")
+    : `<b class="ok">${registeredOk}</b> 成功`;
   $("#autoStatus").innerHTML = `
     <b>${stateLabel}</b>
-    &nbsp;|&nbsp; 已完成: <b class="ok">${s.registered_ok}</b> 成功 / <b class="bad">${s.registered_fail}</b> 失败
+    &nbsp;|&nbsp; 已完成: ${okDisplay} / <b class="bad">${s.registered_fail}</b> 失败
     &nbsp;|&nbsp; 运行: ${elapsed}
     &nbsp;|&nbsp; <span class="auto-meta">${meta}</span>
     ${workerRows ? "<br>" + workerRows : ""}
@@ -888,6 +941,7 @@ function _renderAutoStatus(s) {
   `;
   // 按钮可用性
   const st = s.state;
+  if (st === "stopped") _autoStopRequested = false;
   AUTO_BTNS.start.disabled  = (st === "running" || st === "paused");
   AUTO_BTNS.pause.disabled  = (st !== "running");
   AUTO_BTNS.resume.disabled = (st !== "paused");
@@ -954,6 +1008,7 @@ const PERSIST_FIELDS = {
   autoCoolDown:    "text",
   autoConcurrency: "text",
   autoProxyPool:   "text",
+  autoTargetCount: "text",
 };
 
 function _saveForm() {

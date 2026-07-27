@@ -60,17 +60,24 @@ function tokenButton(row, field, length) {
 
 function linkButton(row, method) {
   const label = LINK_LABELS[method];
+  const email = escapeHtml(row.email);
+  const refreshButton = (disabled = false) => `
+    <button class="icon-action link-refresh" data-action="gen-link" data-method="${method}" data-email="${email}"
+      title="重新获取 ${label} 链接" ${disabled ? "disabled" : ""}>
+      <i data-lucide="refresh-cw"></i>
+    </button>`;
   if (state.activeLinkEmails.has(`${method}:${row.email}`)) {
-    return `<button class="text-action" disabled>${label}…</button>`;
+    return `<span class="link-actions"><button class="text-action" disabled>${label}…</button>${refreshButton(true)}</span>`;
   }
   const info = row.links?.[method];
   const fresh = info?.link && (Date.now() - Number(info.at) * 1000 < LINK_TTL_MS);
   if (fresh) {
     // 生成后不占额外空间：链接放 title 悬浮显示，点击即复制。
-    return `<button class="text-action bound" data-action="copy-link" data-method="${method}" data-email="${escapeHtml(row.email)}" title="${escapeHtml(info.link)}&#10;点击复制">${label} ✓</button>`;
+    return `<span class="link-actions"><button class="text-action bound" data-action="copy-link" data-method="${method}" data-email="${email}" title="${escapeHtml(info.link)}&#10;点击复制">${label} ✓</button>${refreshButton()}</span>`;
   }
   const tip = info?.link ? `${label} 链接已过期，点击重新生成` : `点击生成 ${label} 付款链接`;
-  return `<button class="text-action" data-action="gen-link" data-method="${method}" data-email="${escapeHtml(row.email)}" title="${tip}">${label}</button>`;
+  const text = info?.link ? `${label} 过期` : label;
+  return `<span class="link-actions"><button class="text-action${info?.link ? " expired" : ""}" data-action="gen-link" data-method="${method}" data-email="${email}" title="${tip}">${text}</button>${refreshButton()}</span>`;
 }
 
 function renderRows() {
@@ -175,11 +182,13 @@ async function copyTokens(emails) {
 
 async function copySourceEmails(emails) {
   const values = [];
+  const copiedEmails = [];
   const failed = [];
   for (const email of emails) {
     try {
       const result = await api(`api/account-management/email/${encodeURIComponent(email)}`);
       values.push(result.raw);
+      copiedEmails.push(email);
     } catch (_) {
       failed.push(email);
     }
@@ -187,6 +196,7 @@ async function copySourceEmails(emails) {
   if (!values.length) throw new Error("号池中没有所选账号的原始四段邮箱");
   await copyText(values.join("\n"));
   setToast(`已复制 ${values.length} 条邮箱四段${failed.length ? `，${failed.length} 条未找到` : ""}`, "ok");
+  await markUsed(copiedEmails);
 }
 
 async function copyTwoFactor(emails) {
