@@ -10,7 +10,8 @@ const state = {
   filter: "all",
   rows: [],
   selected: new Set(),
-  taskTimer: null,
+  taskTimers: new Map(),
+  visibleTaskId: "",
   activeRtEmails: new Set(),
   active2faEmails: new Set(),
   activeLinkEmails: new Set(),
@@ -287,7 +288,7 @@ function renderTaskEvents(events = []) {
 }
 
 function watchTask(taskId, label, busy = null, requestedEmails = []) {
-  clearTimeout(state.taskTimer);
+  state.visibleTaskId = taskId;
   $("#taskDrawer").classList.remove("hidden");
   $("#taskTitle").textContent = label;
   $("#taskState").textContent = "等待";
@@ -301,59 +302,73 @@ function watchTask(taskId, label, busy = null, requestedEmails = []) {
   $("#taskProgress").style.width = "0%";
   $("#taskDownloadBtn").hidden = true;
   $("#taskDownloadBtn").dataset.taskId = "";
+  const schedule = (delay) => {
+    const prior = state.taskTimers.get(taskId);
+    if (prior) clearTimeout(prior);
+    state.taskTimers.set(taskId, setTimeout(poll, delay));
+  };
   const poll = async () => {
     try {
       const task = await api(`api/account-tasks/${taskId}`);
+      const isVisible = state.visibleTaskId === taskId;
       const pct = task.total ? Math.round(task.completed / task.total * 100) : 100;
-      $("#taskProgress").style.width = `${pct}%`;
-      $("#taskPhase").textContent = task.phase_label || "处理中";
-      $("#taskMeta").textContent = `${task.completed} / ${task.total}`;
-      $("#taskDetail").textContent = task.phase_detail || task.message || "处理中";
-      $("#taskState").textContent = {
-        queued: "等待", running: "运行中", done: "完成", partial: "部分完成", failed: "失败",
-      }[task.state] || task.state;
-      $("#taskState").className = `task-state ${task.state === "done" ? "ok" : ["failed", "partial"].includes(task.state) ? "bad" : ""}`;
-      const actionBox = $("#taskActionRequired");
-      actionBox.textContent = task.action_required || "";
-      actionBox.classList.toggle("hidden", !task.action_required);
-      renderTaskEvents(task.events);
-      if (task.download_ready) {
-        $("#taskDownloadBtn").hidden = false;
-        $("#taskDownloadBtn").dataset.taskId = taskId;
+      if (isVisible) {
+        $("#taskProgress").style.width = `${pct}%`;
+        $("#taskPhase").textContent = task.phase_label || "处理中";
+        $("#taskMeta").textContent = `${task.completed} / ${task.total}`;
+        $("#taskDetail").textContent = task.phase_detail || task.message || "处理中";
+        $("#taskState").textContent = {
+          queued: "等待", running: "运行中", done: "完成", partial: "部分完成", failed: "失败",
+        }[task.state] || task.state;
+        $("#taskState").className = `task-state ${task.state === "done" ? "ok" : ["failed", "partial"].includes(task.state) ? "bad" : ""}`;
+        const actionBox = $("#taskActionRequired");
+        actionBox.textContent = task.action_required || "";
+        actionBox.classList.toggle("hidden", !task.action_required);
+        renderTaskEvents(task.events);
+        if (task.download_ready) {
+          $("#taskDownloadBtn").hidden = false;
+          $("#taskDownloadBtn").dataset.taskId = taskId;
+        }
       }
       if (["done", "partial", "failed"].includes(task.state)) {
+        state.taskTimers.delete(taskId);
         busy?.emails.forEach(email => busy.set.delete(email));
         const tone = task.succeeded ? "ok" : "bad";
-        setToast(task.message, tone);
+        if (isVisible) setToast(task.message, tone);
         if (["sub2_export", "acquire_rt"].includes(task.kind) && task.download_ready) {
           markUsed(requestedEmails);
         }
         await refresh(false);
-        if (task.kind === "acquire_rt" && task.download_ready) {
+        if (isVisible && task.kind === "acquire_rt" && task.download_ready) {
           window.location.assign(appUrl(`api/account-tasks/${taskId}/download`));
           $("#taskDownloadBtn").hidden = true;
         }
         return;
       }
-      state.taskTimer = setTimeout(poll, 900);
+      schedule(900);
     } catch (error) {
       const detail = String(error?.message || error || "未知错误");
       const missingTask = /(?:404|任务不存在|已过期)/.test(detail);
       if (!missingTask) {
-        $("#taskMeta").textContent = `任务查询失败，正在重试：${detail}`;
-        state.taskTimer = setTimeout(poll, 1500);
+        if (state.visibleTaskId === taskId) {
+          $("#taskMeta").textContent = `任务查询失败，正在重试：${detail}`;
+        }
+        schedule(1500);
         return;
       }
-      clearTimeout(state.taskTimer);
-      state.taskTimer = null;
+      const timer = state.taskTimers.get(taskId);
+      if (timer) clearTimeout(timer);
+      state.taskTimers.delete(taskId);
       busy?.emails.forEach(email => busy.set.delete(email));
       renderRows();
       updateSelection();
-      $("#taskState").textContent = "已中断";
-      $("#taskState").className = "task-state bad";
-      $("#taskMeta").textContent = "任务已中断";
-      $("#taskDetail").textContent = "服务重启或任务已过期，请重新提交。";
-      setToast("后台任务已中断，已解除按钮锁定", "bad");
+      if (state.visibleTaskId === taskId) {
+        $("#taskState").textContent = "已中断";
+        $("#taskState").className = "task-state bad";
+        $("#taskMeta").textContent = "任务已中断";
+        $("#taskDetail").textContent = "服务重启或任务已过期，请重新提交。";
+        setToast("后台任务已中断，已解除按钮锁定", "bad");
+      }
       await refresh(false);
     }
   };
