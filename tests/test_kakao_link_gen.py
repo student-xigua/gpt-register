@@ -863,6 +863,34 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
         self.assertEqual(len(approve_pool), 10)
         self.assertEqual(approve_pool, [fixed] * 10)
 
+    def test_approve_pool_preflight_only_probes_openai(self):
+        proxies = [
+            "http://user-region-kr-sid-one:pass@checkout.example:8000",
+            "http://user-region-kr-sid-two:pass@checkout.example:8000",
+        ]
+        with mock.patch.object(
+            account_ops.proxy_config,
+            "pick_working_proxy",
+            side_effect=lambda proxy, **_kwargs: proxy,
+        ) as pick:
+            selected = account_ops._working_approve_pool(
+                proxies,
+                "KR",
+                "https://api.example/proxy",
+                "kakao",
+            )
+
+        self.assertEqual(selected, proxies)
+        self.assertEqual(pick.call_count, 2)
+        for call in pick.call_args_list:
+            self.assertEqual(
+                call.kwargs["probe_urls"],
+                (account_ops.PAYLINK_CHATGPT_PROBE,),
+            )
+            self.assertFalse(call.kwargs["verify_country"])
+            self.assertEqual(call.kwargs["country"], "KR")
+            self.assertEqual(call.kwargs["attempts"], 3)
+
     def test_kakao_fixed_pool_does_not_duplicate_checkout_when_ten_lines_exist(self):
         proxies = [
             f"http://user-region-kr-{index}:pass@checkout{index}.example:8000"

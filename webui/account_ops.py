@@ -456,22 +456,24 @@ def _working_approve_pool(
     api_url: str,
     method: str,
 ) -> list[str]:
-    """并行预检 approve 出口；账号密码节点失败时按国家切到 API。"""
+    """并行预检 approve 出口；账号密码节点失败时按国家切到 API。
+
+    approve 实际只请求 OpenAI。Stripe/Nicepay 已由 checkout 出口完整预检，
+    每条 approve 出口的国家还会在 ``link_gen`` 提交前再次严格校验；这里不再
+    重复探测三个业务站点和国家，避免十路 Barrier 被最慢预检长期阻塞。
+    """
     candidates = [proxy for proxy in proxies if proxy]
     if not candidates:
         return proxies
 
     def select(proxy: str) -> str:
-        probes = (PAYLINK_CHATGPT_PROBE, PAYLINK_STRIPE_PROBE)
-        if method == "kakao":
-            probes += (PAYLINK_NICEPAY_PROBE,)
         return proxy_config.pick_working_proxy(
             proxy,
             attempts=3,
             api_url=api_url,
             country=country,
-            probe_urls=probes,
-            verify_country=True,
+            probe_urls=(PAYLINK_CHATGPT_PROBE,),
+            verify_country=False,
         )
 
     with concurrent.futures.ThreadPoolExecutor(
