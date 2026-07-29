@@ -16,6 +16,7 @@ const state = {
   activeRtEmails: new Set(),
   active2faEmails: new Set(),
   activeLinkEmails: new Set(),
+  fetchingCodeEmails: new Set(),
   refreshing: false,
   modalData: null,
 };
@@ -97,6 +98,7 @@ function renderRows() {
     const checkedAt = row.plus_check?.checked_at;
     const twoFaBusy = state.active2faEmails.has(row.email);
     const twoFaBound = row.totp_len > 0;
+    const codeBusy = state.fetchingCodeEmails.has(row.email);
     return `<tr>
       <td class="check-cell"><input class="row-check" type="checkbox" data-email="${escapeHtml(row.email)}" ${state.selected.has(row.email) ? "checked" : ""}></td>
       <td class="index-cell">${(state.page - 1) * state.pageSize + index + 1}</td>
@@ -110,6 +112,7 @@ function renderRows() {
       <td><div class="actions">
         <button class="icon-action" data-action="view" data-email="${escapeHtml(row.email)}" title="查看凭证"><i data-lucide="eye"></i></button>
         <button class="icon-action" data-action="email" data-email="${escapeHtml(row.email)}" title="获取原始邮箱四段"><i data-lucide="mail"></i></button>
+        <button class="text-action" data-action="fetch-code" data-email="${escapeHtml(row.email)}" title="从原始 Outlook 邮箱手动获取最近验证码" ${codeBusy ? "disabled" : ""}>${codeBusy ? "取码中" : "接码"}</button>
         <button class="text-action" data-action="status" data-email="${escapeHtml(row.email)}" title="实时刷新账号状态">状态</button>
         <button class="text-action${twoFaBound ? " bound" : ""}" data-action="${twoFaBound ? "copy-2fa" : "bind-2fa"}" data-email="${escapeHtml(row.email)}" title="${twoFaBusy ? "2FA 绑定任务进行中" : twoFaBound ? "复制 账号----密码----2FA 密钥" : "邮箱重认证后绑定 2FA"}" ${twoFaBusy ? "disabled" : ""}>${twoFaBusy ? "处理中" : twoFaBound ? "2FA" : "绑 2FA"}</button>
         ${linkButton(row, "upi")}
@@ -459,6 +462,19 @@ $("#accountsTable").addEventListener("click", async event => {
       showCredential(email, await getCredential(email));
     } else if (action === "email") {
       await copySourceEmails([email]);
+    } else if (action === "fetch-code") {
+      state.fetchingCodeEmails.add(email);
+      renderRows();
+      try {
+        const result = await api(`api/accounts/${encodeURIComponent(email)}/fetch_code`, {
+          method: "POST",
+        });
+        await copyText(result.code);
+        setToast(`验证码 ${result.code}（已复制）`, "ok");
+      } finally {
+        state.fetchingCodeEmails.delete(email);
+        renderRows();
+      }
     } else if (action === "copy-2fa") {
       await copyTwoFactor([email]);
     } else if (action === "bind-2fa") {

@@ -660,6 +660,18 @@ class BulkDeleteRegisteredTests(TempDatabaseTest):
         self.assertNotIn('id="proxyInput"', html)
         self.assertNotIn('$("#proxyInput")', source)
 
+    def test_account_page_exposes_manual_outlook_code_button(self):
+        static_dir = Path(app.__file__).parent / "static"
+        html = (static_dir / "accounts.html").read_text(encoding="utf-8")
+        source = (static_dir / "accounts.js").read_text(encoding="utf-8")
+
+        self.assertIn('data-action="fetch-code"', source)
+        self.assertIn("手动获取最近验证码", source)
+        self.assertIn("fetchingCodeEmails", source)
+        self.assertIn("api/accounts/${encodeURIComponent(email)}/fetch_code", source)
+        self.assertIn("await copyText(result.code);", source)
+        self.assertIn("accounts.js?v=20260729-3", html)
+
 
 class LogSafetyTests(unittest.TestCase):
     def test_redacts_credentials_but_keeps_diagnostic_meaning(self):
