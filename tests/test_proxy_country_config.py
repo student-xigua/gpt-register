@@ -2,6 +2,7 @@ import gc
 import tempfile
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -39,6 +40,32 @@ class ProxyConfigUnitTests(unittest.TestCase):
         self.assertNotEqual(first_proxy, second_proxy)
         self.assertEqual(selected, second_proxy)
         self.assertNotIn("{sid}", selected)
+
+    def test_api_fallback_uses_selected_country_after_primary_failures(self):
+        template = "http://user-region-JP-session-{sid}:pass@proxy.example:10000"
+        with (
+            mock.patch.object(proxy_config, "_proxy_reachable", side_effect=[False, False, True]),
+            mock.patch.object(proxy_config, "fetch_api_proxy", return_value="http://198.51.100.10:10000") as fetch,
+            mock.patch.object(proxy_config, "_proxy_country_matches", return_value=True),
+        ):
+            selected = proxy_config.pick_working_proxy(
+                template,
+                attempts=2,
+                api_url="http://api.example/gen?zone=custom",
+                country="JP",
+            )
+        self.assertEqual(selected, "http://198.51.100.10:10000")
+        fetch.assert_called_once_with("http://api.example/gen?zone=custom", "JP", 10.0)
+
+    def test_api_url_overrides_random_region_with_dropdown_country(self):
+        url = proxy_config.build_api_proxy_url(
+            "http://api.example/gen?zone=custom&sessType=rotating&stype=text",
+            "BR",
+        )
+        query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        self.assertEqual(query["region"], "BR")
+        self.assertEqual(query["proto"], "http")
+        self.assertEqual(query["stype"], "json")
 
     def test_frontend_uses_country_selects_instead_of_proxy_textareas(self):
         root = Path(__file__).resolve().parents[1]

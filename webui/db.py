@@ -918,6 +918,11 @@ def materialize_global_proxy(country: str) -> str:
     return proxy_config.materialize_proxy(get_global_proxy_template(country))
 
 
+def get_api_proxy_url() -> str:
+    """返回服务器私有的 711 白名单 API URL。"""
+    return get_setting("global_proxy_api_url", "").strip()
+
+
 # ──────────────────────── SMS 接码配置 ────────────────────────
 
 

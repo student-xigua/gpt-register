@@ -191,7 +191,11 @@ def api_register(req: RegisterReq):
     is_cf = (mail_source == "cf_temp")
     try:
         task_proxy = req.proxy or (
-            proxy_config.pick_working_proxy(db.get_global_proxy_template(req.proxy_country))
+            proxy_config.pick_working_proxy(
+                db.get_global_proxy_template(req.proxy_country),
+                api_url=db.get_api_proxy_url(),
+                country=req.proxy_country,
+            )
             if req.proxy_country else ""
         )
     except ValueError as exc:
@@ -880,6 +884,7 @@ def api_auto_start(req: AutoLoopStartReq):
     if not data.get("proxy") and not data.get("proxy_pool") and req.proxy_country:
         try:
             data["proxy"] = db.get_global_proxy_template(req.proxy_country)
+            data["api_proxy_url"] = db.get_api_proxy_url()
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     res = AUTO_LOOP.start(data)

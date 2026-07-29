@@ -1,8 +1,12 @@
 """代理国家选项和动态会话模板工具。"""
 from __future__ import annotations
 
+import ipaddress
+import json
 import re
 import secrets
+import urllib.parse
+import urllib.request
 
 
 COUNTRY_OPTIONS = (
@@ -90,8 +94,65 @@ def _proxy_reachable(proxy: str, timeout: float = 10.0) -> bool:
         return False
 
 
-def pick_working_proxy(proxy_template: str, *, attempts: int = 3, timeout: float = 10.0) -> str:
-    """预检动态住宅节点；坏节点自动换 SID，全部失败时返回最后一次供主流程报错。"""
+def build_api_proxy_url(api_url: str, country: str) -> str:
+    """将页面选择的国家写入 711 API，并强制返回可解析的 HTTP JSON。"""
+    parts = urllib.parse.urlsplit(str(api_url or "").strip())
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("711 API URL 无效")
+    params = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    params.update({
+        "count": "1",
+        "proto": "http",
+        "stype": "json",
+        "region": normalize_country(country),
+    })
+    query = urllib.parse.urlencode(params)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+
+def fetch_api_proxy(api_url: str, country: str, timeout: float = 20.0) -> str:
+    """调用白名单 API 并返回一个无账号密码的 HTTP 代理。"""
+    request_url = build_api_proxy_url(api_url, country)
+    with urllib.request.urlopen(request_url, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8", "replace"))
+    if int(payload.get("code") or 0) != 200 or payload.get("success") != "success":
+        raise RuntimeError(f"711 API 返回失败: {payload.get('msg') or payload.get('code')}")
+    rows = payload.get("data") or []
+    if not rows or not isinstance(rows[0], dict):
+        raise RuntimeError("711 API 未返回代理")
+    host = str(rows[0].get("ip") or "").strip()
+    port = int(rows[0].get("port") or 0)
+    ipaddress.ip_address(host)
+    if not 1 <= port <= 65535:
+        raise RuntimeError("711 API 返回的端口无效")
+    return f"http://{host}:{port}"
+
+
+def _proxy_country_matches(proxy: str, country: str, timeout: float = 10.0) -> bool:
+    try:
+        from curl_cffi import requests
+
+        response = requests.get(
+            "https://ipwho.is/",
+            proxies={"http": proxy, "https": proxy},
+            impersonate="chrome136",
+            timeout=timeout,
+        )
+        actual = str(response.json().get("country_code") or "").upper()
+        return actual == normalize_country(country)
+    except Exception:
+        return False
+
+
+def pick_working_proxy(
+    proxy_template: str,
+    *,
+    attempts: int = 3,
+    timeout: float = 10.0,
+    api_url: str = "",
+    country: str = "",
+) -> str:
+    """账号密码代理优先；连续失败后按所选国家调用白名单 API 兜底。"""
     template = str(proxy_template or "").strip()
     if not template:
         return ""
@@ -101,6 +162,16 @@ def pick_working_proxy(proxy_template: str, *, attempts: int = 3, timeout: float
             candidate = materialize_proxy(template)
         if _proxy_reachable(candidate, timeout):
             return candidate
+    if api_url and country:
+        for _ in range(max(1, int(attempts or 1))):
+            try:
+                api_proxy = fetch_api_proxy(api_url, country, max(10.0, timeout))
+            except Exception:
+                continue
+            if _proxy_reachable(api_proxy, timeout) and _proxy_country_matches(
+                api_proxy, country, timeout,
+            ):
+                return api_proxy
     return candidate
 
 

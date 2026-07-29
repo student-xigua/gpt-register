@@ -117,7 +117,7 @@ class AutoLoopTargetTests(unittest.TestCase):
             mock.patch.object(
                 auto_loop.proxy_config,
                 "pick_working_proxy",
-                side_effect=auto_loop.proxy_config.materialize_proxy,
+                side_effect=lambda template, **_kwargs: auto_loop.proxy_config.materialize_proxy(template),
             ),
         ):
             controller._worker_loop(0)
