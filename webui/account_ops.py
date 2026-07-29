@@ -22,7 +22,7 @@ from config import Config
 from log_safety import redact_sensitive_text
 from mail_outlook import OutlookMailProvider
 
-from . import db, exporter, link_gen, twofa
+from . import db, exporter, link_gen, proxy_config, twofa
 from .sms_runtime import build_sms_controller
 
 logger = logging.getLogger("webui.account_ops")
@@ -402,7 +402,7 @@ def _pick_proxy(pool_text: str) -> str:
 
 def _new_kakao_proxy_sid() -> str:
     """生成 8 位 sticky session ID，用于隔离 Kakao checkout / approve 出口。"""
-    return secrets.token_hex(4)
+    return proxy_config.new_sid()
 
 
 def _materialize_proxy_template(proxy: str, sid: str) -> str:

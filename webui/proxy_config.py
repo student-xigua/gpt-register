@@ -29,6 +29,11 @@ _COUNTRY_SELECTOR_RE = re.compile(
 )
 
 
+def new_sid() -> str:
+    """生成 711Proxy 官方格式要求的 8 位数字会话 ID。"""
+    return f"{secrets.randbelow(100_000_000):08d}"
+
+
 def normalize_country(country: str, default: str = "") -> str:
     code = str(country or "").strip().upper()
     if code in SUPPORTED_COUNTRIES:
@@ -65,7 +70,7 @@ def materialize_proxy(proxy: str, *, country: str = "", sid: str = "") -> str:
     if country:
         text = set_proxy_country(text, country)
     if SID_PLACEHOLDER in text:
-        text = text.replace(SID_PLACEHOLDER, sid or secrets.token_hex(5))
+        text = text.replace(SID_PLACEHOLDER, sid or new_sid())
     return text
 
 

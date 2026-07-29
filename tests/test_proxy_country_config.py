@@ -9,6 +9,11 @@ from webui import account_ops, db, proxy_config
 
 
 class ProxyConfigUnitTests(unittest.TestCase):
+    def test_sid_matches_official_eight_digit_format(self):
+        values = {proxy_config.new_sid() for _ in range(20)}
+        self.assertEqual(len(values), 20)
+        self.assertTrue(all(len(value) == 8 and value.isdigit() for value in values))
+
     def test_country_options_cover_payment_flows(self):
         self.assertTrue({"IN", "BR", "KR", "JP", "VN"}.issubset(proxy_config.SUPPORTED_COUNTRIES))
         self.assertEqual(proxy_config.POOL_COUNTRY_DEFAULTS["upi_pool1"], "IN")
