@@ -20,6 +20,7 @@ from typing import Callable, Optional
 from urllib.parse import quote, urljoin, urlsplit
 
 from .exporter import _import_cffi
+from .proxy_config import SUPPORTED_COUNTRIES
 
 OAI_CHECKOUT = "https://chatgpt.com/backend-api/payments/checkout"
 OAI_UPDATE = "https://chatgpt.com/backend-api/payments/checkout/update"
@@ -79,7 +80,7 @@ METHODS: dict[str, dict] = {
         # Kakao 只接受促销生效后的 0 KRW checkout；KR 与 JP/VN 各自保持独立 sticky 会话。
         "require_zero": True,
         "promotion_country": "VN",
-        "promotion_countries": ("JP", "VN"),
+        "promotion_countries": tuple(sorted(SUPPORTED_COUNTRIES)),
         "provider_country": "KR",
         "poll_seconds": 60,
         "link_match": "",
@@ -188,8 +189,11 @@ def _normalize_proxy(raw: str) -> str:
 
 
 def _kakao_proxy_chain(checkout_proxy: str, update_proxy: str) -> tuple[str, str]:
-    """固定 pool1=KR checkout/provider；促销池允许配置的 JP 或 VN 出口。"""
-    checkout = _force_region(checkout_proxy, METHODS["kakao"]["provider_country"])
+    """保留用户选择的国家；没有国家选择器时使用链路默认国家。"""
+    checkout_country = (
+        _proxy_country_hint(checkout_proxy) or METHODS["kakao"]["provider_country"]
+    )
+    checkout = _force_region(checkout_proxy, checkout_country)
     promotion_seed = update_proxy or checkout_proxy
     allowed = tuple(METHODS["kakao"].get("promotion_countries") or ())
     hinted = _proxy_country_hint(promotion_seed)
@@ -571,11 +575,12 @@ def generate_link(
         raise RuntimeError("该账号没有可用的网页 access token，请先『取 RT / 刷新状态』")
     emit = log or (lambda *a, **k: None)
 
-    # UPI 保持原有 IN/BR 双池；Kakao 固定 pool1=KR provider，pool2 可用 JP/VN promotion。
-    channel_region = cfg["country"]
+    # 国家要求作为默认值；代理模板带 country/region 选择器时尊重页面选择。
+    channel_region = _proxy_country_hint(checkout_proxy) or cfg["country"]
     promotion_country = str(cfg.get("promotion_country") or "VN").upper()
     if is_kakao:
         checkout_proxy, update_proxy = _kakao_proxy_chain(checkout_proxy, update_proxy)
+        channel_region = _proxy_country_hint(checkout_proxy) or cfg["provider_country"]
         promotion_country = _proxy_country_hint(update_proxy) or promotion_country
         if promotion_country not in tuple(cfg.get("promotion_countries") or ("VN",)):
             promotion_country = str(cfg.get("promotion_country") or "VN").upper()
@@ -587,10 +592,15 @@ def generate_link(
     if is_kakao:
         emit(
             "proxy_check",
-            f"校验 KR checkout/provider 与 {promotion_country} promotion 出口",
+            f"校验 {channel_region} checkout/provider 与 {promotion_country} promotion 出口",
             status="running",
         )
-        _preflight_kakao_proxy(cffi, checkout_proxy, cfg["provider_country"], "KR checkout/provider")
+        _preflight_kakao_proxy(
+            cffi,
+            checkout_proxy,
+            channel_region,
+            f"{channel_region} checkout/provider",
+        )
         _preflight_kakao_proxy(cffi, update_proxy, promotion_country, f"{promotion_country} promotion")
     checkout_session = cffi.Session(impersonate="chrome")
     promotion_session = cffi.Session(impersonate="chrome") if is_kakao else checkout_session

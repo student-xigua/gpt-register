@@ -503,21 +503,17 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                     # 会话会把后续 JP/VN 请求也粘到 KR，导致促销预检直接失败。
                     checkout_sid = (
                         _new_kakao_proxy_sid()
-                        if method == "kakao" and KAKAO_PROXY_SID_PLACEHOLDER in checkout_template
+                        if KAKAO_PROXY_SID_PLACEHOLDER in checkout_template
                         else ""
                     )
                     promotion_sid = (
                         _new_kakao_proxy_sid()
-                        if method == "kakao" and KAKAO_PROXY_SID_PLACEHOLDER in update_template
+                        if KAKAO_PROXY_SID_PLACEHOLDER in update_template
                         else ""
                     )
                     checkout_proxy = _materialize_proxy_template(checkout_template, checkout_sid)
                     update_proxy = _materialize_proxy_template(update_template, promotion_sid)
-                    approve_pool = (
-                        _kakao_approve_pool(pool1_lines, checkout_proxy)
-                        if method == "kakao"
-                        else pool1_lines
-                    )
+                    approve_pool = _kakao_approve_pool(pool1_lines, checkout_proxy)
                     if method == "kakao":
                         progress(
                             "attempt",

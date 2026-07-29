@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import proxy_config
+
 DB_PATH = Path(__file__).resolve().parent / "webui.db"
 
 _lock = threading.Lock()  # SQLite 写入串行化
@@ -850,6 +852,7 @@ def get_cf_admin_token() -> str:
 # 每个支付方式两个池：pool1=账单国出口（UPI 印度 / Kakao 韩国），pool2=压价出口（通常巴西）。
 # 存多行文本，一行一个代理，任务运行时随机取一行。
 PROXY_POOL_KEYS = ("upi_pool1", "upi_pool2", "kakao_pool1", "kakao_pool2")
+PROXY_COUNTRY_KEYS = tuple(f"{key}_country" for key in PROXY_POOL_KEYS)
 
 
 def get_proxy_pools() -> dict:
@@ -861,6 +864,45 @@ def save_proxy_pools(data: dict) -> None:
     for key in PROXY_POOL_KEYS:
         if key in data:
             set_setting(key, str(data[key] or "").strip())
+
+
+def get_proxy_country_config() -> dict:
+    """返回精简国家选项；缺省时从现有代理推断，再回退到链路默认国家。"""
+    pools = get_proxy_pools()
+    selected: dict[str, str] = {}
+    for pool_key, default in proxy_config.POOL_COUNTRY_DEFAULTS.items():
+        saved = get_setting(f"{pool_key}_country", "").strip().upper()
+        first_proxy = next(iter(str(pools.get(pool_key) or "").splitlines()), "")
+        selected[pool_key] = proxy_config.normalize_country(
+            saved or proxy_config.country_from_proxy(first_proxy, default),
+            default,
+        )
+    return {
+        "selected": selected,
+        "defaults": dict(proxy_config.POOL_COUNTRY_DEFAULTS),
+        "options": proxy_config.country_options_payload(),
+        "configured": {key: bool(str(pools.get(key) or "").strip()) for key in PROXY_POOL_KEYS},
+    }
+
+
+def save_proxy_countries(data: dict) -> None:
+    """保存国家选择，并从服务器私有模板重新生成代理池。"""
+    template = get_setting("global_proxy_template", "").strip()
+    pools = get_proxy_pools()
+    for pool_key, default in proxy_config.POOL_COUNTRY_DEFAULTS.items():
+        country_key = f"{pool_key}_country"
+        if country_key not in data:
+            continue
+        country = proxy_config.normalize_country(data[country_key])
+        source_lines = [line.strip() for line in str(pools.get(pool_key) or "").splitlines() if line.strip()]
+        if template:
+            new_pool = proxy_config.set_proxy_country(template, country)
+        elif source_lines:
+            new_pool = "\n".join(proxy_config.set_proxy_country(line, country) for line in source_lines)
+        else:
+            raise ValueError("服务器尚未配置代理模板")
+        set_setting(pool_key, new_pool)
+        set_setting(country_key, country)
 
 
 # ──────────────────────── SMS 接码配置 ────────────────────────

@@ -1341,10 +1341,15 @@ const PROXY_POOL_KEYS = ["upi_pool1", "upi_pool2", "kakao_pool1", "kakao_pool2"]
 
 async function loadProxyPools() {
   try {
-    const { config } = await api("/api/settings/proxy-pools");
+    const { selected = {}, defaults = {}, options = [], configured = {} } = await api("/api/settings/proxy-pools");
     for (const key of PROXY_POOL_KEYS) {
       const el = $("#" + key);
-      if (el) el.value = config[key] || "";
+      if (!el) continue;
+      el.innerHTML = options.map(({ code, name }) =>
+        `<option value="${code}">${name} (${code})</option>`
+      ).join("");
+      el.value = selected[key] || defaults[key] || "";
+      el.dataset.configured = configured[key] ? "1" : "0";
     }
   } catch (e) {
     console.error("loadProxyPools:", e);
@@ -1353,7 +1358,7 @@ async function loadProxyPools() {
 
 async function saveProxyPools(keys, resultId) {
   const body = {};
-  keys.forEach((key) => { body[key] = $("#" + key).value; });
+  keys.forEach((key) => { body[key + "_country"] = $("#" + key).value; });
   const el = $("#" + resultId);
   try {
     await api("/api/settings/proxy-pools", { method: "POST", body: JSON.stringify(body) });

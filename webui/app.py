@@ -492,7 +492,7 @@ def api_start_gen_link(req: LinkGenReq):
 
 @app.get("/api/settings/proxy-pools")
 def api_get_proxy_pools():
-    return {"ok": True, "config": db.get_proxy_pools()}
+    return {"ok": True, "config": db.get_proxy_pools(), **db.get_proxy_country_config()}
 
 
 class SaveProxyPoolsReq(BaseModel):
@@ -500,11 +500,20 @@ class SaveProxyPoolsReq(BaseModel):
     upi_pool2: Optional[str] = None
     kakao_pool1: Optional[str] = None
     kakao_pool2: Optional[str] = None
+    upi_pool1_country: Optional[str] = None
+    upi_pool2_country: Optional[str] = None
+    kakao_pool1_country: Optional[str] = None
+    kakao_pool2_country: Optional[str] = None
 
 
 @app.post("/api/settings/proxy-pools")
 def api_save_proxy_pools(req: SaveProxyPoolsReq):
-    db.save_proxy_pools(req.model_dump(exclude_none=True))
+    data = req.model_dump(exclude_none=True)
+    try:
+        db.save_proxy_pools(data)
+        db.save_proxy_countries(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return {"ok": True}
 
 

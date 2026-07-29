@@ -424,20 +424,19 @@
     </div>
 
     <div class="tab-content hidden" id="tab-upicfg">
-      <h3 style="margin:0 0 12px;color:var(--pink-dark)">🇮🇳 UPI 提链代理池</h3>
+      <h3 style="margin:0 0 12px;color:var(--pink-dark)">UPI 提链代理国家</h3>
       <p class="hint">
-        账号管理页每行的 <b>UPI</b> 按钮会用这里的代理跑一遍提链流程。<br>
-        每行一个代理，运行时随机取一条。格式：<code>host:port:user:pass</code> 或 <code>http://user:pass@host:port</code>。
+        强制国家已改为默认值；可以从下拉框选择其他出口。每个账号会自动生成独立 <code>{sid}</code> 会话。
       </p>
       <div class="form">
-        <label>代理池1 <small>（账单出口 · 印度 IN 住宅，必填）</small>
-          <textarea id="upi_pool1" rows="4" placeholder="host:port:user:pass&#10;每行一个印度住宅代理" style="font-family:monospace;font-size:12px"></textarea>
+        <label>Checkout / Provider 国家 <small>（默认：印度 IN）</small>
+          <select id="upi_pool1"></select>
         </label>
         <p class="hint" style="margin:-4px 0 8px">
-          👉 代理池1 跑 <b>OpenAI checkout + Stripe 初始化</b>，决定账单/风控出口国家——UPI 必须走印度 IN 才会出现 UPI 付款方式。
+          👉 此出口负责 <b>OpenAI checkout + Stripe 初始化</b>。印度 IN 是代码推荐默认值，其他国家可用于对照测试。
         </p>
-        <label>代理池2 <small>（压价出口 · 巴西 BR 住宅，留空则复用代理池1）</small>
-          <textarea id="upi_pool2" rows="4" placeholder="host:port:user:pass&#10;每行一个巴西住宅代理（可留空）" style="font-family:monospace;font-size:12px"></textarea>
+        <label>Promotion 国家 <small>（默认：巴西 BR）</small>
+          <select id="upi_pool2"></select>
         </label>
         <p class="hint" style="margin:-4px 0 8px">
           👉 代理池2 跑 <b>checkout/update 促销压价（压到 0 INR）</b>这一步；换付款方式 / 确认 / 轮询取链接会在池1、池2之间轮流尝试。
@@ -450,23 +449,22 @@
     </div>
 
     <div class="tab-content hidden" id="tab-kakaocfg">
-      <h3 style="margin:0 0 12px;color:var(--pink-dark)">🇰🇷 Kakao 提链代理池</h3>
+      <h3 style="margin:0 0 12px;color:var(--pink-dark)">Kakao 提链代理国家</h3>
       <p class="hint">
-        账号管理页每行的 <b>Kakao</b> 按钮会用这里的代理跑一遍提链流程。<br>
-        每行一个代理，运行时随机取一条创建 checkout，并从池1物化 10 路 KR approve 出口。格式：<code>host:port:user:pass</code> 或 <code>http://user:pass@host:port</code>；支持用 <code>{sid}</code> 作 Sticky IP 会话占位符。
+        强制国家已改为默认值；可以从下拉框选择其他出口。每个账号只创建一个 checkout，并自动物化 10 路独立 <code>{sid}</code> 会话并发提交。
       </p>
       <div class="form">
-        <label>代理池1 <small>（KR checkout/provider · 韩国住宅，必填）</small>
-          <textarea id="kakao_pool1" rows="4" placeholder="host:port:user:pass&#10;每行一个韩国住宅代理" style="font-family:monospace;font-size:12px"></textarea>
+        <label>Checkout / Provider 国家 <small>（默认：韩国 KR）</small>
+          <select id="kakao_pool1"></select>
         </label>
         <p class="hint" style="margin:-4px 0 8px">
-          👉 代理池1 固定跑 <b>KR checkout/provider</b>：每号只创建 1 个 checkout，确认后在同一 checkout 上发起 10 路并发 approve 尝试，并同时轮询最终跳转；每路执行前会校验实际出口为 KR。
+          👉 此出口负责 <b>checkout/provider</b>。韩国 KR 是推荐默认值；每号只创建 1 个 checkout，随后在同一 checkout 上发起 10 路并发 approve。
         </p>
-        <label>代理池2 <small>（JP / VN promotion · 仅用于促销阶段，留空则由池1代理派生）</small>
-          <textarea id="kakao_pool2" rows="4" placeholder="host:port:user:pass&#10;每行一个 JP 或 VN 促销出口代理（可留空）" style="font-family:monospace;font-size:12px"></textarea>
+        <label>Promotion 国家 <small>（默认：日本 JP）</small>
+          <select id="kakao_pool2"></select>
         </label>
         <p class="hint" style="margin:-4px 0 8px">
-          👉 代理池2 只跑 <b>JP / VN promotion 压价</b>；其余阶段不会使用池2。代理包含 <code>country/region</code> 选择器时会保留 JP/VN 并校验实际出口；若含 <code>{sid}</code>，checkout、promotion 与各 approve 出口会自动使用独立会话。
+          👉 代理池2 只跑 <b>promotion 压价</b>；日本 JP 是推荐默认值。代理包含 <code>{sid}</code> 时，checkout、promotion 与各 approve 出口会自动使用独立会话。
         </p>
         <div class="row">
           <button id="btnSaveKakaoCfg" class="primary">💾 保存配置</button>
@@ -490,6 +488,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=20260727-666ddbf-2"></script>
+<script src="/static/app.js?v=20260729-proxy-country-1"></script>
 </body>
 </html>

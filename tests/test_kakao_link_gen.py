@@ -201,7 +201,7 @@ class KakaoLinkFlowTests(unittest.TestCase):
         self.assertEqual(result["provider_redirect_url"], result["link"])
         self.assertEqual(
             [(country, label) for _, country, label in preflight],
-            [("KR", "KR checkout/provider"), ("VN", "VN promotion")],
+            [("US", "US checkout/provider"), ("BR", "BR promotion")],
         )
 
         checkout_call = next(call for call in scenario.calls if call[1] == link_gen.OAI_CHECKOUT)
@@ -218,9 +218,9 @@ class KakaoLinkFlowTests(unittest.TestCase):
 
         self.assertEqual(checkout_call[2]["json"]["checkout_ui_mode"], "custom")
         self.assertEqual(checkout_call[2]["json"]["cancel_url"], "https://chatgpt.com/#pricing")
-        self.assertIn("region-kr", checkout_call[2]["proxies"]["https"])
-        self.assertIn("region-vn", update_call[2]["proxies"]["https"])
-        self.assertIn("region-kr", tax_call[2]["proxies"]["https"])
+        self.assertIn("region-us", checkout_call[2]["proxies"]["https"])
+        self.assertIn("region-br", update_call[2]["proxies"]["https"])
+        self.assertIn("region-us", tax_call[2]["proxies"]["https"])
         self.assertEqual(pre_confirm_call[2]["data"]["payment_method_type"], "kakao_pay")
         self.assertEqual(
             stripe_update_call[2]["data"]["elements_session_client[stripe_js_id]"],
@@ -285,7 +285,7 @@ class KakaoLinkFlowTests(unittest.TestCase):
             {"openai_llc"},
         )
         self.assertEqual(len({call[2]["proxies"]["https"] for call in approve_calls}), 10)
-        self.assertTrue(all("region-kr" in call[2]["proxies"]["https"] for call in approve_calls))
+        self.assertTrue(all("region-us" in call[2]["proxies"]["https"] for call in approve_calls))
         self.assertFalse(any("region-vn" in call[2]["proxies"]["https"] for call in approve_calls))
         self.assertEqual(len(scenario.sessions), 13)
         self.assertTrue(all(session.closed for session in scenario.sessions))
@@ -376,7 +376,7 @@ class KakaoLinkFlowTests(unittest.TestCase):
         self.assertEqual(result["approve_states"].count("blocked"), 2)
         approve_calls = [call for call in scenario.calls if call[1] == link_gen.OAI_APPROVE]
         self.assertEqual(len(approve_calls), 2)
-        self.assertTrue(all("region-kr" in call[2]["proxies"]["https"] for call in approve_calls))
+        self.assertTrue(all("region-us" in call[2]["proxies"]["https"] for call in approve_calls))
         self.assertTrue(any(
             method == "GET" and url == f"{link_gen.STRIPE_API}/payment_pages/cs_test"
             for method, url, _ in scenario.calls
@@ -533,7 +533,7 @@ class KakaoLinkFlowTests(unittest.TestCase):
         self.assertEqual(len(approve_calls), 2)
         self.assertEqual(result["approve_states"].count("blocked"), 1)
         self.assertEqual(result["approve_states"].count("approved"), 1)
-        self.assertTrue(all("region-in" in call[2]["proxies"]["https"] for call in approve_calls))
+        self.assertTrue(all("region-us" in call[2]["proxies"]["https"] for call in approve_calls))
         self.assertTrue(all(session.closed for session in scenario.sessions))
 
     def test_nonzero_kakao_checkout_stops_before_taxes_and_confirm(self):
@@ -546,17 +546,17 @@ class KakaoLinkFlowTests(unittest.TestCase):
         self.assertFalse(any(url.endswith("/pre_confirm") for url in urls))
         self.assertFalse(any(url.endswith("/confirm") for url in urls))
 
-    def test_proxy_pool_roles_force_kr_checkout_and_vn_promotion(self):
+    def test_proxy_pool_roles_preserve_selected_checkout_and_promotion(self):
         checkout, promotion = link_gen._kakao_proxy_chain(self.checkout_seed, self.promotion_seed)
-        self.assertIn("region-kr", checkout)
-        self.assertIn("region-vn", promotion)
+        self.assertIn("region-us", checkout)
+        self.assertIn("region-br", promotion)
         self.assertIn("checkout.example", checkout)
         self.assertIn("promotion.example", promotion)
 
     def test_proxy_pool_roles_preserve_jp_promotion(self):
         jp_seed = "http://user-region-jp-sid-abc12345:pass@promotion.example:8000"
         checkout, promotion = link_gen._kakao_proxy_chain(self.checkout_seed, jp_seed)
-        self.assertIn("region-kr", checkout)
+        self.assertIn("region-us", checkout)
         self.assertIn("region-jp", promotion)
         self.assertIn("promotion.example", promotion)
 
@@ -568,7 +568,7 @@ class KakaoLinkFlowTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(
             [(country, label) for _, country, label in preflight],
-            [("KR", "KR checkout/provider"), ("JP", "JP promotion")],
+            [("US", "US checkout/provider"), ("JP", "JP promotion")],
         )
         update_call = next(call for call in scenario.calls if call[1] == link_gen.OAI_UPDATE)
         self.assertIn("region-jp", update_call[2]["proxies"]["https"])
