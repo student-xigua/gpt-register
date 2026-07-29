@@ -57,6 +57,28 @@ class ProxyConfigUnitTests(unittest.TestCase):
         self.assertEqual(selected, "http://198.51.100.10:10000")
         fetch.assert_called_once_with("http://api.example/gen?zone=custom", "JP", 10.0)
 
+    def test_paylink_probe_rejects_partial_kr_connectivity_then_uses_api(self):
+        template = "http://user-region-KR-session-{sid}:pass@proxy.example:10000"
+        probes = (
+            "https://chatgpt.com/api/auth/csrf",
+            "https://api.stripe.com/v1/payment_pages",
+            "https://web.nicepay.co.kr/",
+        )
+        with (
+            mock.patch.object(proxy_config, "_proxy_urls_reachable", side_effect=[False, False, True]),
+            mock.patch.object(proxy_config, "fetch_api_proxy", return_value="http://198.51.100.10:10000"),
+            mock.patch.object(proxy_config, "_proxy_country_matches", return_value=True),
+        ):
+            selected = proxy_config.pick_working_proxy(
+                template,
+                attempts=2,
+                api_url="http://api.example/gen",
+                country="KR",
+                probe_urls=probes,
+                verify_country=True,
+            )
+        self.assertEqual(selected, "http://198.51.100.10:10000")
+
     def test_api_url_overrides_random_region_with_dropdown_country(self):
         url = proxy_config.build_api_proxy_url(
             "http://api.example/gen?zone=custom&sessType=rotating&stype=text",
@@ -154,7 +176,11 @@ class UpiDynamicSidTests(unittest.TestCase):
             mock.patch.object(
                 account_ops.proxy_config,
                 "pick_working_proxy",
-                side_effect=lambda proxy, **_kwargs: proxy,
+                side_effect=lambda proxy, **_kwargs: account_ops._materialize_proxy_template(
+                    proxy,
+                    account_ops._new_kakao_proxy_sid()
+                    if account_ops.KAKAO_PROXY_SID_PLACEHOLDER in proxy else "",
+                ),
             ),
         ):
             task_id = account_ops.start_link_gen(["upi@example.com"], "upi")

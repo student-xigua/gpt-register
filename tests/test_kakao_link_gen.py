@@ -648,7 +648,11 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
         self.proxy_picker = mock.patch.object(
             account_ops.proxy_config,
             "pick_working_proxy",
-            side_effect=lambda proxy, **_kwargs: proxy,
+            side_effect=lambda proxy, **_kwargs: account_ops._materialize_proxy_template(
+                proxy,
+                account_ops._new_kakao_proxy_sid()
+                if account_ops.KAKAO_PROXY_SID_PLACEHOLDER in proxy else "",
+            ),
         )
         self.pick_working_proxy = self.proxy_picker.start()
 

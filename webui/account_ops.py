@@ -30,6 +30,9 @@ TASK_TTL_SECONDS = 3600
 KAKAO_ACCOUNT_WORKERS = 5
 KAKAO_APPROVE_WORKERS = 10
 KAKAO_PROXY_SID_PLACEHOLDER = "{sid}"
+PAYLINK_CHATGPT_PROBE = "https://chatgpt.com/api/auth/csrf"
+PAYLINK_STRIPE_PROBE = "https://api.stripe.com/v1/payment_pages"
+PAYLINK_NICEPAY_PROBE = "https://web.nicepay.co.kr/"
 PHASE_LABELS = {
     "queued": "等待执行",
     "prepare": "检查账号资料",
@@ -448,6 +451,7 @@ def _working_approve_pool(
     proxies: list[str],
     country: str,
     api_url: str,
+    method: str,
 ) -> list[str]:
     """并行预检 approve 出口；账号密码节点失败时按国家切到 API。"""
     candidates = [proxy for proxy in proxies if proxy]
@@ -455,11 +459,16 @@ def _working_approve_pool(
         return proxies
 
     def select(proxy: str) -> str:
+        probes = (PAYLINK_CHATGPT_PROBE, PAYLINK_STRIPE_PROBE)
+        if method == "kakao":
+            probes += (PAYLINK_NICEPAY_PROBE,)
         return proxy_config.pick_working_proxy(
             proxy,
-            attempts=2,
+            attempts=3,
             api_url=api_url,
             country=country,
+            probe_urls=probes,
+            verify_country=True,
         )
 
     with concurrent.futures.ThreadPoolExecutor(
@@ -535,30 +544,28 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                     # 账单 KR 与 JP/VN 促销必须使用独立 sticky SID。部分代理商会按
                     # SID 而不是「国家 + SID」绑定出口；若共用 SID，先建立的 KR
                     # 会话会把后续 JP/VN 请求也粘到 KR，导致促销预检直接失败。
-                    checkout_candidate = _materialize_proxy_template(
-                        checkout_template,
-                        _new_kakao_proxy_sid()
-                        if KAKAO_PROXY_SID_PLACEHOLDER in checkout_template else "",
-                    )
-                    update_candidate = _materialize_proxy_template(
-                        update_template,
-                        _new_kakao_proxy_sid()
-                        if KAKAO_PROXY_SID_PLACEHOLDER in update_template else "",
-                    )
+                    checkout_probes = (PAYLINK_CHATGPT_PROBE, PAYLINK_STRIPE_PROBE)
+                    if method == "kakao":
+                        checkout_probes += (PAYLINK_NICEPAY_PROBE,)
                     checkout_proxy = proxy_config.pick_working_proxy(
-                        checkout_candidate,
+                        checkout_template,
                         api_url=api_proxy_url,
                         country=checkout_country,
+                        probe_urls=checkout_probes,
+                        verify_country=True,
                     )
                     update_proxy = proxy_config.pick_working_proxy(
-                        update_candidate,
+                        update_template,
                         api_url=api_proxy_url,
                         country=promotion_country,
+                        probe_urls=(PAYLINK_CHATGPT_PROBE,),
+                        verify_country=True,
                     )
                     approve_pool = _working_approve_pool(
                         _kakao_approve_pool(pool1_lines, checkout_proxy),
                         checkout_country,
                         api_proxy_url,
+                        method,
                     )
                     if method == "kakao":
                         progress(

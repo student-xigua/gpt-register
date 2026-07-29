@@ -94,6 +94,26 @@ def _proxy_reachable(proxy: str, timeout: float = 10.0) -> bool:
         return False
 
 
+def _proxy_urls_reachable(proxy: str, urls: tuple[str, ...], timeout: float = 10.0) -> bool:
+    """验证同一 sticky 出口能否连接业务链路中的全部目标。"""
+    try:
+        from curl_cffi import requests
+
+        for url in urls:
+            response = requests.get(
+                url,
+                proxies={"http": proxy, "https": proxy},
+                impersonate="chrome136",
+                timeout=timeout,
+            )
+            status = int(response.status_code)
+            if status == 407 or status >= 500:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def build_api_proxy_url(api_url: str, country: str) -> str:
     """将页面选择的国家写入 711 API，并强制返回可解析的 HTTP JSON。"""
     parts = urllib.parse.urlsplit(str(api_url or "").strip())
@@ -154,6 +174,8 @@ def pick_working_proxy(
     timeout: float = 10.0,
     api_url: str = "",
     country: str = "",
+    probe_urls: tuple[str, ...] = (),
+    verify_country: bool = False,
 ) -> str:
     """账号密码代理优先；连续失败后按所选国家调用白名单 API 兜底。"""
     template = str(proxy_template or "").strip()
@@ -163,7 +185,15 @@ def pick_working_proxy(
     for index in range(max(1, int(attempts or 1))):
         if index:
             candidate = materialize_proxy(template)
-        if _proxy_reachable(candidate, timeout):
+        reachable = (
+            _proxy_urls_reachable(candidate, probe_urls, timeout)
+            if probe_urls else _proxy_reachable(candidate, timeout)
+        )
+        if reachable and (
+            not verify_country
+            or not country
+            or _proxy_country_matches(candidate, country, timeout)
+        ):
             return candidate
     if api_url and country:
         for _ in range(max(1, int(attempts or 1))):
@@ -171,7 +201,11 @@ def pick_working_proxy(
                 api_proxy = fetch_api_proxy(api_url, country, max(10.0, timeout))
             except Exception:
                 continue
-            if _proxy_reachable(api_proxy, timeout) and _proxy_country_matches(
+            reachable = (
+                _proxy_urls_reachable(api_proxy, probe_urls, timeout)
+                if probe_urls else _proxy_reachable(api_proxy, timeout)
+            )
+            if reachable and _proxy_country_matches(
                 api_proxy, country, timeout,
             ):
                 return api_proxy
