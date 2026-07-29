@@ -537,13 +537,21 @@ _FILTER_WHERE = {
 }
 
 
-def _registered_filter(filter_rt: str) -> tuple[str, tuple]:
-    return _FILTER_WHERE.get(filter_rt, ("", ()))
+def _registered_filter(filter_rt: str, search: str = "") -> tuple[str, tuple]:
+    where, params = _FILTER_WHERE.get(filter_rt, ("", ()))
+    keyword = str(search or "").strip().lower()[:200]
+    if keyword:
+        # 搜索按邮箱字面子串匹配；转义 LIKE 通配符，避免输入 %/_ 意外匹配全表。
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        connector = "AND" if where else "WHERE"
+        where = f"{where} {connector} lower(email) LIKE ? ESCAPE '\\'"
+        params = (*params, f"%{escaped}%")
+    return where, params
 
 
-def count_registered(filter_rt: str = "all") -> int:
+def count_registered(filter_rt: str = "all", search: str = "") -> int:
     con = _conn()
-    where, params = _registered_filter(filter_rt)
+    where, params = _registered_filter(filter_rt, search)
     cur = con.execute(f"SELECT COUNT(*) FROM registered {where}", params)
     return cur.fetchone()[0]
 
@@ -575,9 +583,14 @@ def registered_summary() -> dict:
     return summary
 
 
-def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") -> list[dict]:
+def list_registered(
+    limit: int = 20,
+    offset: int = 0,
+    filter_rt: str = "all",
+    search: str = "",
+) -> list[dict]:
     con = _conn()
-    where, params = _registered_filter(filter_rt)
+    where, params = _registered_filter(filter_rt, search)
     cur = con.execute(
         f"SELECT email, password, "
         f"length(access_token) AS at_len, length(session_token) AS st_len, "

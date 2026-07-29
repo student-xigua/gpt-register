@@ -515,6 +515,26 @@ class PlanFilterTests(TempDatabaseTest):
         self.seed("free@example.com", "free", "Free")
         self.assertEqual(app.api_registered(filter="'; DROP TABLE registered--")["total"], 1)
 
+    def test_account_search_is_case_insensitive_and_combines_with_filter(self):
+        self.seed("Alpha.Plus@outlook.com", "plus_active", "Plus")
+        self.seed("alpha.free@outlook.com", "free", "Free")
+        self.seed("other@outlook.com", "plus_active", "Plus")
+
+        all_matches = app.api_registered(search="ALPHA")
+        plus_matches = app.api_registered(filter="plus", search="alpha")
+
+        self.assertEqual(all_matches["total"], 2)
+        self.assertEqual(
+            {item["email"] for item in all_matches["items"]},
+            {"alpha.plus@outlook.com", "alpha.free@outlook.com"},
+        )
+        self.assertEqual(plus_matches["total"], 1)
+        self.assertEqual(plus_matches["items"][0]["email"], "alpha.plus@outlook.com")
+
+    def test_account_search_treats_like_wildcards_as_text(self):
+        self.save("normal@example.com")
+        self.assertEqual(app.api_registered(search="%_")["total"], 0)
+
     def test_plan_status_column_is_backfilled_from_legacy_extra_json(self):
         legacy = Path(self.tempdir.name) / "legacy.db"
         original = db.DB_PATH
@@ -626,6 +646,19 @@ class BulkDeleteRegisteredTests(TempDatabaseTest):
             delete_selected.index('api("api/registered/bulk_delete"'),
             delete_selected.index("confirm("),
         )
+
+    def test_account_page_exposes_debounced_server_side_search(self):
+        static_dir = Path(app.__file__).parent / "static"
+        html = (static_dir / "accounts.html").read_text(encoding="utf-8")
+        source = (static_dir / "accounts.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="searchInput"', html)
+        self.assertIn('type="search"', html)
+        self.assertIn("state.search = event.target.value.trim();", source)
+        self.assertIn("search=${encodeURIComponent(state.search)}", source)
+        self.assertIn("setTimeout(() =>", source)
+        self.assertNotIn('id="proxyInput"', html)
+        self.assertNotIn('$("#proxyInput")', source)
 
 
 class LogSafetyTests(unittest.TestCase):

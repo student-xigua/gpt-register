@@ -8,6 +8,7 @@ const state = {
   pageSize: 20,
   total: 0,
   filter: "all",
+  search: "",
   rows: [],
   selected: new Set(),
   taskTimers: new Map(),
@@ -85,7 +86,10 @@ function linkButton(row, method) {
 function renderRows() {
   const body = $("#accountsTable tbody");
   if (!state.rows.length) {
-    body.innerHTML = `<tr><td class="empty" colspan="10"><i data-lucide="database-zap"></i> 当前筛选下暂无账号</td></tr>`;
+    const message = state.search
+      ? `未找到包含“${escapeHtml(state.search)}”的账号`
+      : "当前筛选下暂无账号";
+    body.innerHTML = `<tr><td class="empty" colspan="10"><i data-lucide="database-zap"></i> ${message}</td></tr>`;
     initIcons();
     return;
   }
@@ -129,7 +133,7 @@ async function refresh(reset = false, { notify = false } = {}) {
   if (reset) state.page = 1;
   const offset = (state.page - 1) * state.pageSize;
   try {
-    const result = await api(`api/registered?limit=${state.pageSize}&offset=${offset}&filter=${encodeURIComponent(state.filter)}`);
+    const result = await api(`api/registered?limit=${state.pageSize}&offset=${offset}&filter=${encodeURIComponent(state.filter)}&search=${encodeURIComponent(state.search)}`);
     state.rows = result.items;
     state.total = result.total;
     if (state.page > totalPages()) {
@@ -262,7 +266,6 @@ async function startTask(path, emails, label) {
     method: "POST",
     body: JSON.stringify({
       emails,
-      proxy: $("#proxyInput").value.trim(),
       otp_timeout: 180,
     }),
   });
@@ -410,6 +413,15 @@ $("#plusFilter").addEventListener("change", event => {
 });
 
 $("#refreshBtn").addEventListener("click", () => refresh(false, { notify: true }));
+let searchTimer = null;
+$("#searchInput").addEventListener("input", event => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    state.search = event.target.value.trim();
+    state.selected.clear();
+    refresh(true);
+  }, 300);
+});
 $("#pageSize").addEventListener("change", event => {
   state.pageSize = Number(event.target.value);
   state.selected.clear();

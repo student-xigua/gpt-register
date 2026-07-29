@@ -324,11 +324,19 @@ def api_runs(limit: int = 50):
 
 
 @app.get("/api/registered")
-def api_registered(limit: int = 20, offset: int = 0, filter: str = "all"):
+def api_registered(
+    limit: int = 20,
+    offset: int = 0,
+    filter: str = "all",
+    search: str = "",
+):
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
-    items = db.list_registered(limit=limit, offset=offset, filter_rt=filter)
-    total = db.count_registered(filter_rt=filter)
+    search = str(search or "").strip()[:200]
+    items = db.list_registered(
+        limit=limit, offset=offset, filter_rt=filter, search=search,
+    )
+    total = db.count_registered(filter_rt=filter, search=search)
     return {
         "ok": True,
         "items": items,

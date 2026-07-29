@@ -54,6 +54,7 @@
         <button data-filter="has_rt">有 RT</button>
         <button data-filter="no_rt">无 RT</button>
       </div>
+      <input id="searchInput" class="control" type="search" placeholder="搜索账号邮箱" aria-label="搜索账号邮箱">
       <button id="refreshBtn" title="刷新列表"><i data-lucide="refresh-cw"></i>刷新</button>
       <span class="selection-note">已选 <b id="selectedCount">0</b></span>
       <button id="deleteSelectedBtn" class="danger" disabled title="批量删除选中的注册凭证（不影响号池）"><i data-lucide="trash-2"></i>删除选中</button>
@@ -65,7 +66,6 @@
       <button id="statusPageBtn"><i data-lucide="scan-search"></i>刷新当前页</button>
       <button id="downloadBtn" class="primary" disabled><i data-lucide="download"></i>下载 Sub2API</button>
       <span class="spacer"></span>
-      <input id="proxyInput" class="control" placeholder="代理 URL（可选，勿填状态）" title="仅填写 http://user:pass@host:port 等代理地址；留空则直连">
     </section>
 
     <section class="table-card">
@@ -142,6 +142,6 @@
 <div class="toast" id="toast"></div>
 <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
 <script src="static/workbench-common.js"></script>
-<script src="static/accounts.js?v=20260729-1"></script>
+<script src="static/accounts.js?v=20260729-2"></script>
 </body>
 </html>
