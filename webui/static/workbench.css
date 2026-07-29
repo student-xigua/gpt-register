@@ -211,6 +211,16 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--blue); }
 .modal-head { height: 48px; flex: 0 0 48px; display: flex; align-items: center; gap: 8px; padding: 0 13px; border-bottom: 1px solid var(--line); }
 .modal-head h2 { flex: 1; margin: 0; font-size: 14px; }
 .modal-body { padding: 12px; overflow: auto; }
+.manual-oauth-card { width: min(680px, 92vw); }
+.manual-oauth-body { color: #314039; font-size: 12px; line-height: 1.6; }
+.manual-oauth-body p { margin: 0 0 8px; }
+.manual-oauth-body ol { margin: 0 0 12px; padding-left: 22px; }
+.manual-oauth-body code { padding: 1px 4px; background: var(--surface-muted); border-radius: 3px; }
+.oauth-open-link { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 12px; padding: 7px 10px; color: #fff; background: var(--blue); border-radius: 5px; text-decoration: none; font-weight: 700; }
+.oauth-open-link svg { width: 14px; }
+.oauth-callback-label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.oauth-callback { width: 100%; min-height: 88px; resize: vertical; padding: 8px 9px; border: 1px solid var(--line-strong); border-radius: 5px; font: 10px/1.45 "SFMono-Regular", Consolas, monospace; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 12px; }
 .field-row { display: grid; grid-template-columns: 125px 1fr auto; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid #edf0ee; }
 .field-row label { color: var(--muted); font-size: 10px; text-transform: uppercase; }
 .field-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }

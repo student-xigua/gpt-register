@@ -16,7 +16,8 @@ const state = {
   activeRtEmails: new Set(),
   active2faEmails: new Set(),
   activeLinkEmails: new Set(),
-  fetchingCodeEmails: new Set(),
+  manualOauthFlowId: "",
+  manualOauthEmail: "",
   refreshing: false,
   modalData: null,
 };
@@ -98,7 +99,6 @@ function renderRows() {
     const checkedAt = row.plus_check?.checked_at;
     const twoFaBusy = state.active2faEmails.has(row.email);
     const twoFaBound = row.totp_len > 0;
-    const codeBusy = state.fetchingCodeEmails.has(row.email);
     return `<tr>
       <td class="check-cell"><input class="row-check" type="checkbox" data-email="${escapeHtml(row.email)}" ${state.selected.has(row.email) ? "checked" : ""}></td>
       <td class="index-cell">${(state.page - 1) * state.pageSize + index + 1}</td>
@@ -112,7 +112,7 @@ function renderRows() {
       <td><div class="actions">
         <button class="icon-action" data-action="view" data-email="${escapeHtml(row.email)}" title="查看凭证"><i data-lucide="eye"></i></button>
         <button class="icon-action" data-action="email" data-email="${escapeHtml(row.email)}" title="获取原始邮箱四段"><i data-lucide="mail"></i></button>
-        <button class="text-action" data-action="fetch-code" data-email="${escapeHtml(row.email)}" title="从原始 Outlook 邮箱手动获取最近验证码" ${codeBusy ? "disabled" : ""}>${codeBusy ? "取码中" : "接码"}</button>
+        <button class="text-action" data-action="manual-sub2" data-email="${escapeHtml(row.email)}" title="手动登录、按需绑定手机号并生成 Sub2 文件">手动 Sub2</button>
         <button class="text-action" data-action="status" data-email="${escapeHtml(row.email)}" title="实时刷新账号状态">状态</button>
         <button class="text-action${twoFaBound ? " bound" : ""}" data-action="${twoFaBound ? "copy-2fa" : "bind-2fa"}" data-email="${escapeHtml(row.email)}" title="${twoFaBusy ? "2FA 绑定任务进行中" : twoFaBound ? "复制 账号----密码----2FA 密钥" : "邮箱重认证后绑定 2FA"}" ${twoFaBusy ? "disabled" : ""}>${twoFaBusy ? "处理中" : twoFaBound ? "2FA" : "绑 2FA"}</button>
         ${linkButton(row, "upi")}
@@ -294,6 +294,60 @@ async function startLinkTask(email, method) {
   watchTask(result.task_id, `生成 ${LINK_LABELS[method]} 链接`, { set: state.activeLinkEmails, emails: [key] }, [email]);
 }
 
+async function startManualOauth(email) {
+  const result = await api("api/account-management/manual-oauth/start", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+  state.manualOauthFlowId = result.flow_id;
+  state.manualOauthEmail = email;
+  $("#manualOauthAccount").textContent = email;
+  $("#manualOauthLink").href = result.auth_url;
+  $("#manualCallbackInput").value = "";
+  $("#manualOauthModal").classList.remove("hidden");
+  initIcons();
+}
+
+function downloadBase64Json(contentB64, filename) {
+  const binary = atob(contentB64);
+  const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "sub2.json";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function completeManualOauth() {
+  const callbackUrl = $("#manualCallbackInput").value.trim();
+  if (!callbackUrl) throw new Error("请粘贴浏览器地址栏中的完整 localhost 回调 URL");
+  if (!state.manualOauthFlowId) throw new Error("授权流程已失效，请重新点击“手动 Sub2”");
+  const button = $("#manualOauthCompleteBtn");
+  button.disabled = true;
+  button.textContent = "正在交换 Token…";
+  try {
+    const result = await api("api/account-management/manual-oauth/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        flow_id: state.manualOauthFlowId,
+        callback_url: callbackUrl,
+      }),
+    });
+    downloadBase64Json(result.content_b64, result.filename);
+    $("#manualOauthModal").classList.add("hidden");
+    state.manualOauthFlowId = "";
+    state.manualOauthEmail = "";
+    await refresh(false);
+    setToast("手动授权完成，RT 已保存并下载 Sub2 文件", "ok");
+  } finally {
+    button.disabled = false;
+    button.textContent = "生成并下载 Sub2";
+  }
+}
+
 function renderTaskEvents(events = []) {
   const visible = events.slice(-8);
   $("#taskEvents").innerHTML = visible.map(event => `
@@ -462,19 +516,8 @@ $("#accountsTable").addEventListener("click", async event => {
       showCredential(email, await getCredential(email));
     } else if (action === "email") {
       await copySourceEmails([email]);
-    } else if (action === "fetch-code") {
-      state.fetchingCodeEmails.add(email);
-      renderRows();
-      try {
-        const result = await api(`api/accounts/${encodeURIComponent(email)}/fetch_code`, {
-          method: "POST",
-        });
-        await copyText(result.code);
-        setToast(`验证码 ${result.code}（已复制）`, "ok");
-      } finally {
-        state.fetchingCodeEmails.delete(email);
-        renderRows();
-      }
+    } else if (action === "manual-sub2") {
+      await startManualOauth(email);
     } else if (action === "copy-2fa") {
       await copyTwoFactor([email]);
     } else if (action === "bind-2fa") {
@@ -531,6 +574,14 @@ $("#copyJsonBtn").addEventListener("click", () => {
     () => setToast("凭证 JSON 已复制", "ok"),
     error => setToast(error.message, "bad"),
   );
+});
+$("#manualOauthCloseBtn").addEventListener("click", () => $("#manualOauthModal").classList.add("hidden"));
+$("#manualOauthCancelBtn").addEventListener("click", () => $("#manualOauthModal").classList.add("hidden"));
+$("#manualOauthModal").addEventListener("click", event => {
+  if (event.target === $("#manualOauthModal")) $("#manualOauthModal").classList.add("hidden");
+});
+$("#manualOauthCompleteBtn").addEventListener("click", () => {
+  completeManualOauth().catch(error => setToast(error.message, "bad"));
 });
 $("#taskCloseBtn").addEventListener("click", () => $("#taskDrawer").classList.add("hidden"));
 $("#taskDownloadBtn").addEventListener("click", event => {

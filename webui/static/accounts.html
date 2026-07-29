@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>账号管理 · GPT Register</title>
-  <link rel="stylesheet" href="static/workbench.css">
+  <link rel="stylesheet" href="static/workbench.css?v=20260729-2">
 </head>
 <body>
 <div class="app-shell">
@@ -119,6 +119,33 @@
   </div>
 </div>
 
+<div class="modal hidden" id="manualOauthModal" role="dialog" aria-modal="true">
+  <div class="modal-card manual-oauth-card">
+    <div class="modal-head">
+      <h2>手动授权并生成 Sub2</h2>
+      <button id="manualOauthCloseBtn" class="icon-action" aria-label="关闭"><i data-lucide="x"></i></button>
+    </div>
+    <div class="modal-body manual-oauth-body">
+      <p>当前账号：<b id="manualOauthAccount"></b></p>
+      <ol>
+        <li>点击“打开 OpenAI 授权页面”，使用当前账号登录。</li>
+        <li>如果 OpenAI 要求绑定手机号，请在授权页面完成绑定。</li>
+        <li>最后浏览器会跳到无法打开的 <code>localhost:1455</code> 页面，这是正常的。</li>
+        <li>复制浏览器地址栏中的完整 URL，粘贴到下面。</li>
+      </ol>
+      <a id="manualOauthLink" class="oauth-open-link" href="#" target="_blank" rel="noopener noreferrer">
+        <i data-lucide="external-link"></i>打开 OpenAI 授权页面
+      </a>
+      <label class="oauth-callback-label" for="manualCallbackInput">完整回调 URL</label>
+      <textarea id="manualCallbackInput" class="oauth-callback" spellcheck="false" placeholder="http://localhost:1455/auth/callback?code=...&state=..."></textarea>
+      <div class="modal-actions">
+        <button id="manualOauthCancelBtn">取消</button>
+        <button id="manualOauthCompleteBtn" class="primary">生成并下载 Sub2</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <aside class="task-drawer hidden" id="taskDrawer" aria-live="polite">
   <div class="task-title">
     <span class="task-icon"><i data-lucide="loader-circle"></i></span>
@@ -142,6 +169,6 @@
 <div class="toast" id="toast"></div>
 <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
 <script src="static/workbench-common.js"></script>
-<script src="static/accounts.js?v=20260729-3"></script>
+<script src="static/accounts.js?v=20260729-4"></script>
 </body>
 </html>

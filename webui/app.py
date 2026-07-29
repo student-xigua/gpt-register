@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import queue
@@ -25,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from log_safety import setup_app_logging  # noqa: E402
-from . import account_ops, db, proxy_config, registrar  # noqa: E402
+from . import account_ops, db, manual_oauth, proxy_config, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 
 # 启动时自动释放卡死的 in_use 号（上次进程崩溃 / 强退留下的）
@@ -508,6 +509,52 @@ def api_start_gen_link(req: LinkGenReq):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"ok": True, "task_id": task_id}
+
+
+class ManualOAuthStartReq(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+
+
+class ManualOAuthCompleteReq(BaseModel):
+    flow_id: str = Field(..., min_length=8, max_length=200)
+    callback_url: str = Field(..., min_length=10, max_length=4096)
+
+
+@app.post("/api/account-management/manual-oauth/start")
+def api_manual_oauth_start(req: ManualOAuthStartReq):
+    email = str(req.email or "").strip().lower()
+    if not db.get_registered(email):
+        raise HTTPException(404, "账号不在已注册列表中")
+    try:
+        result = manual_oauth.start_flow(email)
+    except manual_oauth.ManualOAuthError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return JSONResponse(
+        {"ok": True, **result},
+        headers={"Cache-Control": "no-store, private"},
+    )
+
+
+@app.post("/api/account-management/manual-oauth/complete")
+def api_manual_oauth_complete(req: ManualOAuthCompleteReq):
+    try:
+        result = manual_oauth.complete_flow(req.flow_id, req.callback_url)
+    except manual_oauth.ManualOAuthError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.update_registered_fields(
+        result["email"],
+        refresh_token=result["refresh_token"],
+        id_token=result["id_token"] or None,
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "email": result["email"],
+            "filename": result["filename"],
+            "content_b64": base64.b64encode(result["content"]).decode("ascii"),
+        },
+        headers={"Cache-Control": "no-store, private"},
+    )
 
 
 @app.get("/api/settings/proxy-pools")

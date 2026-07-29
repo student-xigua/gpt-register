@@ -57,6 +57,43 @@ class TempDatabaseTest(unittest.TestCase):
         self.fail("background task did not finish")
 
 
+class ManualOAuthEndpointTests(TempDatabaseTest):
+    def test_start_requires_registered_account(self):
+        with self.assertRaises(Exception):
+            app.api_manual_oauth_start(
+                app.ManualOAuthStartReq(email="missing@example.com")
+            )
+
+    def test_complete_persists_rt_without_overwriting_web_at(self):
+        self.save("person@example.com", at="web-at", rt="")
+        content = b'{"version":1,"accounts":[],"proxies":[]}'
+        with mock.patch.object(
+            app.manual_oauth,
+            "complete_flow",
+            return_value={
+                "email": "person@example.com",
+                "refresh_token": "manual-rt",
+                "id_token": "manual-id",
+                "filename": "sub2_person.json",
+                "content": content,
+            },
+        ):
+            response = app.api_manual_oauth_complete(
+                app.ManualOAuthCompleteReq(
+                    flow_id="flow-identifier",
+                    callback_url="http://localhost:1455/auth/callback?code=x&state=y",
+                )
+            )
+        payload = json.loads(response.body)
+        saved = db.get_registered("person@example.com")
+
+        self.assertEqual(saved["refresh_token"], "manual-rt")
+        self.assertEqual(saved["id_token"], "manual-id")
+        self.assertEqual(saved["access_token"], "web-at")
+        self.assertEqual(base64.b64decode(payload["content_b64"]), content)
+        self.assertIn("no-store", response.headers["cache-control"])
+
+
 class Sub2DownloadTests(TempDatabaseTest):
     def setUp(self):
         super().setUp()
@@ -660,17 +697,18 @@ class BulkDeleteRegisteredTests(TempDatabaseTest):
         self.assertNotIn('id="proxyInput"', html)
         self.assertNotIn('$("#proxyInput")', source)
 
-    def test_account_page_exposes_manual_outlook_code_button(self):
+    def test_account_page_exposes_manual_sub2_oauth_flow(self):
         static_dir = Path(app.__file__).parent / "static"
         html = (static_dir / "accounts.html").read_text(encoding="utf-8")
         source = (static_dir / "accounts.js").read_text(encoding="utf-8")
 
-        self.assertIn('data-action="fetch-code"', source)
-        self.assertIn("手动获取最近验证码", source)
-        self.assertIn("fetchingCodeEmails", source)
-        self.assertIn("api/accounts/${encodeURIComponent(email)}/fetch_code", source)
-        self.assertIn("await copyText(result.code);", source)
-        self.assertIn("accounts.js?v=20260729-3", html)
+        self.assertIn('data-action="manual-sub2"', source)
+        self.assertNotIn('data-action="fetch-code"', source)
+        self.assertIn("api/account-management/manual-oauth/start", source)
+        self.assertIn("api/account-management/manual-oauth/complete", source)
+        self.assertIn('id="manualOauthModal"', html)
+        self.assertIn("localhost:1455/auth/callback", html)
+        self.assertIn("accounts.js?v=20260729-4", html)
 
 
 class LogSafetyTests(unittest.TestCase):
