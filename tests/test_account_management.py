@@ -593,6 +593,41 @@ class UsageStatusTests(TempDatabaseTest):
         )
 
 
+class BulkDeleteRegisteredTests(TempDatabaseTest):
+    def test_bulk_delete_selected_registered_accounts_only(self):
+        for email in ("bad-one@example.com", "bad-two@example.com", "keep@example.com"):
+            self.save(email)
+
+        response = app.api_bulk_delete_registered(
+            app.BulkDeleteRegisteredReq(
+                emails=["bad-one@example.com", "bad-two@example.com"]
+            )
+        )
+
+        self.assertEqual(response, {"ok": True, "deleted": 2, "by": "emails"})
+        self.assertIsNone(db.get_registered("bad-one@example.com"))
+        self.assertIsNone(db.get_registered("bad-two@example.com"))
+        self.assertIsNotNone(db.get_registered("keep@example.com"))
+
+    def test_account_page_exposes_confirmed_bulk_delete_action(self):
+        static_dir = Path(app.__file__).parent / "static"
+        html = (static_dir / "accounts.html").read_text(encoding="utf-8")
+        source = (static_dir / "accounts.js").read_text(encoding="utf-8")
+        start = source.index("async function deleteSelectedAccounts")
+        end = source.index("\nasync function", start + 1)
+        delete_selected = source[start:end]
+
+        self.assertIn('id="deleteSelectedBtn"', html)
+        self.assertIn("删除选中", html)
+        self.assertIn('confirm(`确定删除选中的 ${emails.length} 个账号注册凭证？', delete_selected)
+        self.assertIn('api("api/registered/bulk_delete"', delete_selected)
+        self.assertIn("body: JSON.stringify({ emails })", delete_selected)
+        self.assertGreater(
+            delete_selected.index('api("api/registered/bulk_delete"'),
+            delete_selected.index("confirm("),
+        )
+
+
 class LogSafetyTests(unittest.TestCase):
     def test_redacts_credentials_but_keeps_diagnostic_meaning(self):
         text = redact_sensitive_text(

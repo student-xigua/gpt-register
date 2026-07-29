@@ -30,7 +30,7 @@ function selectedEmails() {
 function updateSelection() {
   const count = state.selected.size;
   $("#selectedCount").textContent = count;
-  for (const id of ["copyAtBtn", "copyEmailBtn", "copy2faBtn", "statusSelectedBtn"]) {
+  for (const id of ["deleteSelectedBtn", "copyAtBtn", "copyEmailBtn", "copy2faBtn", "statusSelectedBtn"]) {
     $(`#${id}`).disabled = count === 0;
   }
   $("#acquireRtBtn").disabled = count === 0
@@ -222,6 +222,20 @@ async function copyTwoFactor(emails) {
   await copyText(result.lines.join("\n"));
   const missing = result.missing?.length || 0;
   setToast(`已复制 ${result.lines.length} 条 2FA${missing ? `，跳过 ${missing} 个未绑定账号` : ""}`, "ok");
+}
+
+async function deleteSelectedAccounts() {
+  const emails = selectedEmails();
+  if (!emails.length) throw new Error("请先勾选要删除的异常账号");
+  if (!confirm(`确定删除选中的 ${emails.length} 个账号注册凭证？\n此操作不可恢复，但不会删除号池中的原始邮箱。`)) return;
+
+  const result = await api("api/registered/bulk_delete", {
+    method: "POST",
+    body: JSON.stringify({ emails }),
+  });
+  state.selected.clear();
+  await refresh();
+  setToast(`已删除 ${result.deleted || 0} 个账号`, "ok");
 }
 
 function showCredential(email, data) {
@@ -464,6 +478,7 @@ $("#accountsTable").addEventListener("click", async event => {
 });
 
 $("#copyAtBtn").addEventListener("click", () => copyTokens(selectedEmails()).catch(error => setToast(error.message, "bad")));
+$("#deleteSelectedBtn").addEventListener("click", () => deleteSelectedAccounts().catch(error => setToast(error.message, "bad")));
 $("#copyEmailBtn").addEventListener("click", () => copySourceEmails(selectedEmails()).catch(error => setToast(error.message, "bad")));
 $("#copy2faBtn").addEventListener("click", () => copyTwoFactor(selectedEmails()).catch(error => setToast(error.message, "bad")));
 $("#acquireRtBtn").addEventListener("click", () => startTask("api/account-management/tasks/acquire-rt", selectedEmails(), "批量获取 RT").catch(error => setToast(error.message, "bad")));
