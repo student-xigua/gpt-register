@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Optional
 
-from . import db, registrar
+from . import db, proxy_config, registrar
 
 logger = logging.getLogger("auto_loop")
 
@@ -358,8 +358,8 @@ class AutoLoopController:
     def _worker_loop(self, worker_id: int):
         """单 worker 循环：claim → 跑 → 等结束 → 继续。"""
         idle_round = 0
-        proxy = self._proxy_for_worker(worker_id)
-        logger.info(f"[worker-{worker_id}] 启动 (proxy={proxy or '直连'})")
+        proxy_template = self._proxy_for_worker(worker_id)
+        logger.info(f"[worker-{worker_id}] 启动 (proxy={'已配置' if proxy_template else '直连'})")
 
         while True:
             # 检查停止
@@ -424,6 +424,7 @@ class AutoLoopController:
 
             # 给这个 run 注入 worker 自己的代理
             run_options = dict(self._options)
+            proxy = proxy_config.materialize_proxy(proxy_template)
             if proxy:
                 run_options["proxy"] = proxy
 

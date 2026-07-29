@@ -53,8 +53,13 @@
       <label>邮箱 <small>(留空 = 自动 claim 下一个 available)</small>
         <input id="regEmail" placeholder="留空 = 自动选号 / 或填指定邮箱">
       </label>
-      <label>代理 <small>(直连留空，Plus检查复用此代理)</small>
-        <input id="regProxy" placeholder="socks5://user:pass@host:1080">
+      <label>代理国家 <small>（默认日本；每次任务自动更换 {sid}）</small>
+        <select id="regProxyCountry">
+          <option value="JP" selected>日本</option><option value="BR">巴西</option>
+          <option value="IN">印度</option><option value="KR">韩国</option>
+          <option value="VN">越南</option><option value="US">美国</option>
+          <option value="SG">新加坡</option><option value="GB">英国</option>
+        </select>
       </label>
       <label>OTP 等待秒数
         <input id="regOtpTimeout" type="number" value="180" min="10" max="600">
@@ -82,9 +87,14 @@
         </label>
       </div>
       <div class="row">
-        <label class="check inline-check" style="width:100%" title="多代理池：每行一个，worker 按顺序轮流取；如果留空则所有 worker 都用上面的「代理」字段">
-          <span style="white-space:nowrap">代理池:</span>
-          <textarea id="autoProxyPool" rows="3" placeholder="留空 = 所有 worker 用同一个代理&#10;每行一个代理，并发 N 时 worker 0~N 依次用&#10;例：&#10;socks5://127.0.0.1:7890&#10;socks5://127.0.0.1:7891&#10;http://1.2.3.4:8080" style="flex:1;font-family:monospace;font-size:12px;margin-left:4px"></textarea>
+        <label class="check inline-check" style="width:100%" title="每个账号会按所选国家生成新的 sticky session">
+          <span style="white-space:nowrap">批量代理国家:</span>
+          <select id="autoProxyCountry" style="flex:1;margin-left:4px">
+            <option value="JP" selected>日本</option><option value="BR">巴西</option>
+            <option value="IN">印度</option><option value="KR">韩国</option>
+            <option value="VN">越南</option><option value="US">美国</option>
+            <option value="SG">新加坡</option><option value="GB">英国</option>
+          </select>
         </label>
       </div>
       <div class="row">
@@ -488,6 +498,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=20260729-proxy-country-1"></script>
+<script src="/static/app.js?v=20260729-proxy-country-2"></script>
 </body>
 </html>

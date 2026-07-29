@@ -98,6 +98,7 @@ class AutoLoopTargetTests(unittest.TestCase):
 
     def test_failed_run_releases_capacity_and_only_success_reaches_target(self):
         controller = self._controller(1)
+        controller._options["proxy"] = "http://user-region-JP-session-{sid}:pass@proxy.example:10000"
         wait_results = iter(((False, "network"), (True, "")))
 
         with (
@@ -117,6 +118,9 @@ class AutoLoopTargetTests(unittest.TestCase):
             controller._worker_loop(0)
 
         self.assertEqual(start_registration.call_count, 2)
+        proxies = [call.args[1]["proxy"] for call in start_registration.call_args_list]
+        self.assertEqual(len(set(proxies)), 2)
+        self.assertTrue(all("{sid}" not in proxy for proxy in proxies))
         self.assertEqual(controller._registered_ok, 1)
         self.assertEqual(controller._registered_fail, 1)
         self.assertEqual(controller._in_flight, 0)

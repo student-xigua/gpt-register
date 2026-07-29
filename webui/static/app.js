@@ -99,7 +99,7 @@ $("#btnRun").addEventListener("click", async () => {
   const email = $("#regEmail").value.trim();
   const opts = {
     email: email || null,
-    proxy: $("#regProxy").value.trim(),
+    proxy_country: $("#regProxyCountry").value,
     otp_timeout: parseInt($("#regOtpTimeout").value || "180", 10),
     want_access_token: true,
     want_session_token: true,
@@ -837,8 +837,7 @@ const AUTO_BTNS = {
 
 function _autoOptions() {
   return {
-    proxy: $("#regProxy").value.trim(),
-    proxy_pool: $("#autoProxyPool").value,
+    proxy_country: $("#autoProxyCountry").value,
     concurrency: parseInt($("#autoConcurrency").value || "1", 10),
     otp_timeout: parseInt($("#regOtpTimeout").value || "180", 10),
     want_access_token: true,
@@ -1003,11 +1002,11 @@ const FORM_KEY = "gpt_outlook_register_form_v1";
 
 // id -> 类型（默认 text；checkbox 走 .checked）
 const PERSIST_FIELDS = {
-  regProxy:        "text",
+  regProxyCountry: "text",
   regOtpTimeout:   "text",
   autoCoolDown:    "text",
   autoConcurrency: "text",
-  autoProxyPool:   "text",
+  autoProxyCountry:"text",
   autoTargetCount: "text",
 };
 

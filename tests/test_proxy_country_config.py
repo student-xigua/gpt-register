@@ -32,6 +32,12 @@ class ProxyConfigUnitTests(unittest.TestCase):
             self.assertIn(f'<select id="{key}">', html)
             self.assertNotIn(f'<textarea id="{key}"', html)
         self.assertIn('body[key + "_country"]', script)
+        self.assertIn('<select id="regProxyCountry">', html)
+        self.assertIn('<select id="autoProxyCountry"', html)
+        self.assertNotIn('id="regProxy"', html)
+        self.assertNotIn('id="autoProxyPool"', html)
+        self.assertIn('proxy_country: $("#regProxyCountry").value', script)
+        self.assertIn('proxy_country: $("#autoProxyCountry").value', script)
 
 
 class ProxyCountryDbTests(unittest.TestCase):
@@ -64,6 +70,17 @@ class ProxyCountryDbTests(unittest.TestCase):
         db.set_setting("global_proxy_template", "http://user-region-{country}:pass@proxy.example:1")
         with self.assertRaisesRegex(ValueError, "不支持的代理国家"):
             db.save_proxy_countries({"upi_pool1_country": "ZZ"})
+
+    def test_global_proxy_materializes_a_new_sid_per_task(self):
+        db.set_setting(
+            "global_proxy_template",
+            "http://user-region-{country}-session-{sid}:pass@proxy.example:10000",
+        )
+        first = db.materialize_global_proxy("JP")
+        second = db.materialize_global_proxy("JP")
+        self.assertIn("region-JP", first)
+        self.assertNotIn("{sid}", first)
+        self.assertNotEqual(first, second)
 
 
 class UpiDynamicSidTests(unittest.TestCase):

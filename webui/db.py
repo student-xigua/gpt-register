@@ -905,6 +905,19 @@ def save_proxy_countries(data: dict) -> None:
         set_setting(country_key, country)
 
 
+def get_global_proxy_template(country: str) -> str:
+    """按国家返回私有代理模板，保留 ``{sid}`` 供每个任务单独物化。"""
+    template = get_setting("global_proxy_template", "").strip()
+    if not template:
+        raise ValueError("服务器尚未配置代理模板")
+    return proxy_config.set_proxy_country(template, proxy_config.normalize_country(country))
+
+
+def materialize_global_proxy(country: str) -> str:
+    """为单次任务生成指定国家的独立 sticky session 代理。"""
+    return proxy_config.materialize_proxy(get_global_proxy_template(country))
+
+
 # ──────────────────────── SMS 接码配置 ────────────────────────
 
 

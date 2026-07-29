@@ -60,6 +60,7 @@ class RegisterReq(BaseModel):
     want_session_token: bool = True
     want_refresh_token: bool = True
     proxy: str = ""
+    proxy_country: str = ""
     otp_timeout: int = 180
     allow_existing_login: bool = True
 
@@ -188,6 +189,12 @@ def api_register(req: RegisterReq):
     """启动注册任务，返回 run_id。前端拿 run_id 去 /api/runs/{run_id}/stream 订阅 SSE。"""
     mail_source = db.get_setting("mail_source", "outlook")
     is_cf = (mail_source == "cf_temp")
+    try:
+        task_proxy = req.proxy or (
+            db.materialize_global_proxy(req.proxy_country) if req.proxy_country else ""
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     if is_cf:
         # CF 模式：不需要 outlook 号池，用虚拟占位 account
@@ -211,7 +218,7 @@ def api_register(req: RegisterReq):
         "want_access_token": req.want_access_token,
         "want_session_token": req.want_session_token,
         "want_refresh_token": req.want_refresh_token,
-        "proxy": req.proxy,
+        "proxy": task_proxy,
         "otp_timeout": int(req.otp_timeout),
         "allow_existing_login": req.allow_existing_login,
     }
@@ -858,6 +865,7 @@ class AutoLoopStartReq(BaseModel):
     want_refresh_token: bool = True
     proxy: str = ""              # 单代理（concurrency=1 + 无代理池时用）
     proxy_pool: str = ""         # 多代理池（每行一个）；优先于 proxy
+    proxy_country: str = ""      # 国家下拉；每个 run 自动物化独立 {sid}
     concurrency: int = 1         # 并发 worker 数（1-20）
     otp_timeout: int = 180
     allow_existing_login: bool = True
@@ -867,7 +875,13 @@ class AutoLoopStartReq(BaseModel):
 
 @app.post("/api/auto/start")
 def api_auto_start(req: AutoLoopStartReq):
-    res = AUTO_LOOP.start(req.model_dump())
+    data = req.model_dump()
+    if not data.get("proxy") and not data.get("proxy_pool") and req.proxy_country:
+        try:
+            data["proxy"] = db.get_global_proxy_template(req.proxy_country)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    res = AUTO_LOOP.start(data)
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "启动失败"))
     return res
