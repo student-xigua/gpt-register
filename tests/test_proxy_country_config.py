@@ -15,6 +15,33 @@ class ProxyConfigUnitTests(unittest.TestCase):
         self.assertEqual(len(values), 20)
         self.assertTrue(all(len(value) == 8 and value.isdigit() for value in values))
 
+    def test_1024_sid_is_eight_character_alphanumeric(self):
+        template = (
+            "http://user-region-KR-sid-{sid}-t-5:pass@us.1024proxy.io:3000"
+        )
+        values = {proxy_config.new_sid_for_proxy(template) for _ in range(20)}
+        self.assertEqual(len(values), 20)
+        self.assertTrue(all(len(value) == 8 and value.isalnum() for value in values))
+        # 1024Proxy 不能使用纯数字 SID；生成器需保证测试集合中有字母。
+        self.assertTrue(all(any(char.isalpha() for char in value) for value in values))
+
+    def test_711_sid_remains_eight_digits(self):
+        template = "http://user-region-KR-session-{sid}:pass@global.rotgb.711proxy.com:10000"
+        values = [proxy_config.new_sid_for_proxy(template) for _ in range(20)]
+        self.assertTrue(all(len(value) == 8 and value.isdigit() for value in values))
+
+    def test_materialize_1024_proxy_uses_provider_sid_format(self):
+        template = (
+            "http://user-region-{country}-sid-{sid}-t-5:pass@us.1024proxy.io:3000"
+        )
+        actual = proxy_config.materialize_proxy(template, country="KR")
+        self.assertIn("region-KR", actual)
+        self.assertNotIn("{sid}", actual)
+        sid = actual.split("-sid-", 1)[1].split("-t-", 1)[0]
+        self.assertEqual(len(sid), 8)
+        self.assertTrue(sid.isalnum())
+        self.assertTrue(any(char.isalpha() for char in sid))
+
     def test_country_options_cover_payment_flows(self):
         self.assertTrue({"IN", "BR", "KR", "JP", "VN"}.issubset(proxy_config.SUPPORTED_COUNTRIES))
         self.assertEqual(proxy_config.POOL_COUNTRY_DEFAULTS["upi_pool1"], "IN")
@@ -90,6 +117,39 @@ class ProxyConfigUnitTests(unittest.TestCase):
         self.assertEqual(query["stype"], "json")
         self.assertEqual(query["sessType"], "sticky")
         self.assertEqual(query["sessTime"], "5")
+
+    def test_1024_api_url_uses_txt_and_selected_country(self):
+        url = proxy_config.build_api_proxy_url(
+            "https://white.1024proxy.com/white/api?region=JP&num=1&time=10&format=1&type=txt",
+            "KR",
+        )
+        query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        self.assertEqual(query["region"], "KR")
+        self.assertEqual(query["num"], "1")
+        self.assertEqual(query["format"], "1")
+        self.assertEqual(query["type"], "txt")
+
+    def test_fetch_1024_api_txt_response(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"105.33.13.23:8080\n"
+
+        with mock.patch.object(proxy_config.urllib.request, "urlopen", return_value=Response()) as open_url:
+            actual = proxy_config.fetch_api_proxy(
+                "https://white.1024proxy.com/white/api?region=JP&num=1&time=10&format=1&type=txt",
+                "JP",
+            )
+        self.assertEqual(actual, "http://105.33.13.23:8080")
+        request = open_url.call_args.args[0]
+        self.assertIn("region=JP", request.full_url)
+        self.assertIn("type=txt", request.full_url)
+        self.assertEqual(request.get_header("User-agent"), "Mozilla/5.0")
 
     def test_frontend_uses_country_selects_instead_of_proxy_textareas(self):
         root = Path(__file__).resolve().parents[1]

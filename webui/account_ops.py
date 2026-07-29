@@ -403,9 +403,9 @@ def _pick_proxy(pool_text: str) -> str:
     return random.choice(lines) if lines else ""
 
 
-def _new_kakao_proxy_sid() -> str:
-    """生成 8 位 sticky session ID，用于隔离 Kakao checkout / approve 出口。"""
-    return proxy_config.new_sid()
+def _new_kakao_proxy_sid(proxy: str = "") -> str:
+    """按代理商格式生成 sticky SID，隔离 Kakao checkout / approve 出口。"""
+    return proxy_config.new_sid_for_proxy(proxy)
 
 
 def _materialize_proxy_template(proxy: str, sid: str) -> str:
@@ -442,7 +442,10 @@ def _kakao_approve_pool(
     proxies = [checkout_proxy]
     for index in range(count - 1):
         template = remaining[index % len(remaining)]
-        sid = _new_kakao_proxy_sid() if KAKAO_PROXY_SID_PLACEHOLDER in template else ""
+        sid = (
+            _new_kakao_proxy_sid(template)
+            if KAKAO_PROXY_SID_PLACEHOLDER in template else ""
+        )
         proxies.append(_materialize_proxy_template(template, sid))
     return proxies
 

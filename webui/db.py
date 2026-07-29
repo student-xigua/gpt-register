@@ -919,7 +919,7 @@ def materialize_global_proxy(country: str) -> str:
 
 
 def get_api_proxy_url() -> str:
-    """返回服务器私有的 711 白名单 API URL。"""
+    """返回服务器私有的代理商白名单 API URL。"""
     return get_setting("global_proxy_api_url", "").strip()
 
 

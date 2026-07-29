@@ -5,6 +5,7 @@ import ipaddress
 import json
 import re
 import secrets
+import string
 import urllib.parse
 import urllib.request
 
@@ -36,6 +37,22 @@ _COUNTRY_SELECTOR_RE = re.compile(
 def new_sid() -> str:
     """生成 711Proxy 官方格式要求的 8 位数字会话 ID。"""
     return f"{secrets.randbelow(100_000_000):08d}"
+
+
+def new_sid_for_proxy(proxy: str) -> str:
+    """按代理商格式生成 sticky SID。
+
+    711Proxy 接受 8 位数字；1024Proxy 的账号模式要求 8 位大小写字母/数字，
+    纯数字 SID 在其网关上会触发 TLS/连接失败。
+    """
+    hostname = (urllib.parse.urlsplit(str(proxy or "").strip()).hostname or "").lower()
+    if hostname.endswith("1024proxy.io"):
+        alphabet = string.ascii_letters + string.digits
+        value = [secrets.choice(alphabet) for _ in range(8)]
+        if not any(char.isalpha() for char in value):
+            value[secrets.randbelow(len(value))] = secrets.choice(string.ascii_letters)
+        return "".join(value)
+    return new_sid()
 
 
 def normalize_country(country: str, default: str = "") -> str:
@@ -74,7 +91,7 @@ def materialize_proxy(proxy: str, *, country: str = "", sid: str = "") -> str:
     if country:
         text = set_proxy_country(text, country)
     if SID_PLACEHOLDER in text:
-        text = text.replace(SID_PLACEHOLDER, sid or new_sid())
+        text = text.replace(SID_PLACEHOLDER, sid or new_sid_for_proxy(text))
     return text
 
 
@@ -115,11 +132,23 @@ def _proxy_urls_reachable(proxy: str, urls: tuple[str, ...], timeout: float = 10
 
 
 def build_api_proxy_url(api_url: str, country: str) -> str:
-    """将页面选择的国家写入 711 API，并强制返回可解析的 HTTP JSON。"""
+    """将页面选择的国家写入代理商 API，并规范为 HTTP 单节点返回。"""
     parts = urllib.parse.urlsplit(str(api_url or "").strip())
     if parts.scheme not in {"http", "https"} or not parts.netloc:
-        raise ValueError("711 API URL 无效")
+        raise ValueError("代理 API URL 无效")
     params = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    hostname = (parts.hostname or "").lower()
+    if "1024proxy.com" in hostname:
+        # 1024 白名单 API 返回纯文本 ip:port；region 必须由页面国家下拉覆盖。
+        params.update({
+            "region": normalize_country(country),
+            "num": "1",
+            "time": params.get("time") or "10",
+            "format": "1",
+            "type": "txt",
+        })
+        query = urllib.parse.urlencode(params)
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
     params.update({
         "count": "1",
         "proto": "http",
@@ -134,10 +163,40 @@ def build_api_proxy_url(api_url: str, country: str) -> str:
 
 
 def fetch_api_proxy(api_url: str, country: str, timeout: float = 20.0) -> str:
-    """调用白名单 API 并返回一个无账号密码的 HTTP 代理。"""
+    """调用白名单 API 并返回一个无账号密码的 HTTP 代理。
+
+    同时兼容 711 的 JSON 响应和 1024Proxy 的纯文本 ``ip:port`` 响应。
+    """
     request_url = build_api_proxy_url(api_url, country)
-    with urllib.request.urlopen(request_url, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8", "replace"))
+    # 1024 白名单端点会拒绝 Python urllib 的默认 User-Agent；显式使用通用 UA。
+    request = urllib.request.Request(
+        request_url,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8", "replace")
+    hostname = (urllib.parse.urlsplit(request_url).hostname or "").lower()
+    if "1024proxy.com" in hostname:
+        for line in raw.splitlines():
+            value = line.strip()
+            if not value:
+                continue
+            # 1024 txt 模式为 ip:port；兼容返回带 scheme 或 JSON 的情况。
+            candidate = value
+            if candidate.startswith(("http://", "https://")):
+                candidate = urllib.parse.urlsplit(candidate).netloc
+            if ":" not in candidate:
+                continue
+            host, port_text = candidate.rsplit(":", 1)
+            try:
+                ipaddress.ip_address(host.strip("[]"))
+                port = int(port_text)
+            except (ValueError, TypeError):
+                continue
+            if 1 <= port <= 65535:
+                return f"http://{host}:{port}"
+        raise RuntimeError("1024Proxy API 未返回有效的 ip:port")
+    payload = json.loads(raw)
     if int(payload.get("code") or 0) != 200 or payload.get("success") != "success":
         raise RuntimeError(f"711 API 返回失败: {payload.get('msg') or payload.get('code')}")
     rows = payload.get("data") or []
