@@ -69,5 +69,35 @@ def materialize_proxy(proxy: str, *, country: str = "", sid: str = "") -> str:
     return text
 
 
+def _proxy_reachable(proxy: str, timeout: float = 10.0) -> bool:
+    """用项目实际 TLS 客户端验证代理能否访问 ChatGPT。"""
+    try:
+        from curl_cffi import requests
+
+        response = requests.get(
+            "https://chatgpt.com/api/auth/csrf",
+            proxies={"http": proxy, "https": proxy},
+            impersonate="chrome136",
+            timeout=timeout,
+        )
+        return 200 <= int(response.status_code) < 500 and int(response.status_code) != 407
+    except Exception:
+        return False
+
+
+def pick_working_proxy(proxy_template: str, *, attempts: int = 3, timeout: float = 10.0) -> str:
+    """预检动态住宅节点；坏节点自动换 SID，全部失败时返回最后一次供主流程报错。"""
+    template = str(proxy_template or "").strip()
+    if not template:
+        return ""
+    candidate = materialize_proxy(template)
+    for index in range(max(1, int(attempts or 1))):
+        if index:
+            candidate = materialize_proxy(template)
+        if _proxy_reachable(candidate, timeout):
+            return candidate
+    return candidate
+
+
 def country_options_payload() -> list[dict[str, str]]:
     return [{"code": code, "name": name} for code, name in COUNTRY_OPTIONS]

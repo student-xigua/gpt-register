@@ -24,6 +24,17 @@ class ProxyConfigUnitTests(unittest.TestCase):
         self.assertNotIn("{country}", actual)
         self.assertNotIn("{sid}", actual)
 
+    def test_bad_dynamic_node_is_replaced_before_task_starts(self):
+        template = "http://user-region-JP-session-{sid}:pass@proxy.example:10000"
+        with mock.patch.object(proxy_config, "_proxy_reachable", side_effect=[False, True]) as check:
+            selected = proxy_config.pick_working_proxy(template, attempts=3)
+        self.assertEqual(check.call_count, 2)
+        first_proxy = check.call_args_list[0].args[0]
+        second_proxy = check.call_args_list[1].args[0]
+        self.assertNotEqual(first_proxy, second_proxy)
+        self.assertEqual(selected, second_proxy)
+        self.assertNotIn("{sid}", selected)
+
     def test_frontend_uses_country_selects_instead_of_proxy_textareas(self):
         root = Path(__file__).resolve().parents[1]
         html = (root / "webui" / "static" / "index.html").read_text(encoding="utf-8")

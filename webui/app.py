@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from log_safety import setup_app_logging  # noqa: E402
-from . import account_ops, db, registrar  # noqa: E402
+from . import account_ops, db, proxy_config, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 
 # 启动时自动释放卡死的 in_use 号（上次进程崩溃 / 强退留下的）
@@ -191,7 +191,8 @@ def api_register(req: RegisterReq):
     is_cf = (mail_source == "cf_temp")
     try:
         task_proxy = req.proxy or (
-            db.materialize_global_proxy(req.proxy_country) if req.proxy_country else ""
+            proxy_config.pick_working_proxy(db.get_global_proxy_template(req.proxy_country))
+            if req.proxy_country else ""
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

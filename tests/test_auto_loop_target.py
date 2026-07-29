@@ -114,6 +114,11 @@ class AutoLoopTargetTests(unittest.TestCase):
                 "_wait_run_finish",
                 side_effect=lambda _run_id: next(wait_results),
             ),
+            mock.patch.object(
+                auto_loop.proxy_config,
+                "pick_working_proxy",
+                side_effect=auto_loop.proxy_config.materialize_proxy,
+            ),
         ):
             controller._worker_loop(0)
 

@@ -424,7 +424,7 @@ class AutoLoopController:
 
             # 给这个 run 注入 worker 自己的代理
             run_options = dict(self._options)
-            proxy = proxy_config.materialize_proxy(proxy_template)
+            proxy = proxy_config.pick_working_proxy(proxy_template)
             if proxy:
                 run_options["proxy"] = proxy
 
