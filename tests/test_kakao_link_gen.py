@@ -645,8 +645,15 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
             "kakao_pool1": "http://user-region-kr:pass@checkout.example:8000",
             "kakao_pool2": "http://user-region-vn:pass@promotion.example:8000",
         })
+        self.proxy_picker = mock.patch.object(
+            account_ops.proxy_config,
+            "pick_working_proxy",
+            side_effect=lambda proxy, **_kwargs: proxy,
+        )
+        self.pick_working_proxy = self.proxy_picker.start()
 
     def tearDown(self):
+        self.proxy_picker.stop()
         db.DB_PATH = self.original_db_path
         with account_ops._lock:
             account_ops._tasks.clear()
@@ -678,6 +685,40 @@ class KakaoTaskPersistenceTests(unittest.TestCase):
         self.assertEqual(task["state"], "done")
         row = db.list_registered(limit=10)[0]
         self.assertEqual(row["links"]["kakao"]["link"], final_link)
+
+    def test_kakao_checkout_promotion_and_approvals_use_country_api_fallback(self):
+        db.set_setting("kakao_pool1_country", "KR")
+        db.set_setting("kakao_pool2_country", "JP")
+        db.set_setting("global_proxy_api_url", "http://api.example/gen?zone=custom")
+        self.pick_working_proxy.side_effect = lambda _proxy, **kwargs: (
+            "http://198.51.100.10:10000"
+            if kwargs.get("country") == "KR"
+            else "http://198.51.100.20:10000"
+        )
+        success = {
+            "ok": True,
+            "link": "https://web.nicepay.co.kr/kakao/checkout",
+            "amount": "0",
+            "approve_states": ["approved"],
+        }
+        with mock.patch.object(account_ops.link_gen, "generate_link", return_value=success) as generate:
+            task_id = account_ops.start_link_gen(["kakao@example.com"], "kakao")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                task = account_ops.get_task(task_id)
+                if task and task["finished_at"]:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("Kakao API fallback task did not finish")
+
+        call = generate.call_args
+        self.assertEqual(call.kwargs["checkout_country"], "KR")
+        self.assertEqual(call.kwargs["promotion_country"], "JP")
+        self.assertEqual(call.kwargs["checkout_proxy"], "http://198.51.100.10:10000")
+        self.assertEqual(call.kwargs["update_proxy"], "http://198.51.100.20:10000")
+        self.assertEqual(len(call.kwargs["checkout_pool"]), 10)
+        self.assertTrue(all(proxy == "http://198.51.100.10:10000" for proxy in call.kwargs["checkout_pool"]))
 
     def test_background_kakao_uses_one_checkout_and_ten_parallel_approvals(self):
         checkout_lines = [

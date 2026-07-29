@@ -105,6 +105,9 @@ def build_api_proxy_url(api_url: str, country: str) -> str:
         "proto": "http",
         "stype": "json",
         "region": normalize_country(country),
+        "sessType": "sticky",
+        "sessTime": "5",
+        "sessAuto": "0",
     })
     query = urllib.parse.urlencode(params)
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))

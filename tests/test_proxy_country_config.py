@@ -66,6 +66,8 @@ class ProxyConfigUnitTests(unittest.TestCase):
         self.assertEqual(query["region"], "BR")
         self.assertEqual(query["proto"], "http")
         self.assertEqual(query["stype"], "json")
+        self.assertEqual(query["sessType"], "sticky")
+        self.assertEqual(query["sessTime"], "5")
 
     def test_frontend_uses_country_selects_instead_of_proxy_textareas(self):
         root = Path(__file__).resolve().parents[1]
@@ -147,7 +149,14 @@ class UpiDynamicSidTests(unittest.TestCase):
 
     def test_upi_materializes_checkout_promotion_and_ten_approvals(self):
         success = {"ok": True, "link": "https://payments.stripe.com/upi/instructions/demo", "amount": "0"}
-        with mock.patch.object(account_ops.link_gen, "generate_link", return_value=success) as generate:
+        with (
+            mock.patch.object(account_ops.link_gen, "generate_link", return_value=success) as generate,
+            mock.patch.object(
+                account_ops.proxy_config,
+                "pick_working_proxy",
+                side_effect=lambda proxy, **_kwargs: proxy,
+            ),
+        ):
             task_id = account_ops.start_link_gen(["upi@example.com"], "upi")
             deadline = time.time() + 2
             while time.time() < deadline:

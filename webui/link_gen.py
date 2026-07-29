@@ -188,16 +188,28 @@ def _normalize_proxy(raw: str) -> str:
     return "http://" + raw
 
 
-def _kakao_proxy_chain(checkout_proxy: str, update_proxy: str) -> tuple[str, str]:
+def _kakao_proxy_chain(
+    checkout_proxy: str,
+    update_proxy: str,
+    checkout_country: str = "",
+    promotion_country: str = "",
+) -> tuple[str, str]:
     """保留用户选择的国家；没有国家选择器时使用链路默认国家。"""
     checkout_country = (
-        _proxy_country_hint(checkout_proxy) or METHODS["kakao"]["provider_country"]
+        str(checkout_country or "").upper()
+        or _proxy_country_hint(checkout_proxy)
+        or METHODS["kakao"]["provider_country"]
     )
     checkout = _force_region(checkout_proxy, checkout_country)
     promotion_seed = update_proxy or checkout_proxy
     allowed = tuple(METHODS["kakao"].get("promotion_countries") or ())
     hinted = _proxy_country_hint(promotion_seed)
-    promotion_country = hinted if hinted in allowed else METHODS["kakao"]["promotion_country"]
+    requested_promotion = str(promotion_country or "").upper()
+    promotion_country = (
+        requested_promotion
+        if requested_promotion in allowed
+        else hinted if hinted in allowed else METHODS["kakao"]["promotion_country"]
+    )
     promotion = _force_region(promotion_seed, promotion_country)
     return checkout, promotion
 
@@ -551,6 +563,8 @@ def generate_link(
     update_proxy: str = "",
     checkout_pool: Optional[list[str]] = None,
     update_pool: Optional[list[str]] = None,
+    checkout_country: str = "",
+    promotion_country: str = "",
     poll_seconds: int = 35,
     approve_workers: int = 10,
     log: Optional[Callable[..., None]] = None,
@@ -576,12 +590,29 @@ def generate_link(
     emit = log or (lambda *a, **k: None)
 
     # 国家要求作为默认值；代理模板带 country/region 选择器时尊重页面选择。
-    channel_region = _proxy_country_hint(checkout_proxy) or cfg["country"]
-    promotion_country = str(cfg.get("promotion_country") or "VN").upper()
+    channel_region = (
+        str(checkout_country or "").upper()
+        or _proxy_country_hint(checkout_proxy)
+        or cfg["country"]
+    )
+    requested_promotion_country = str(promotion_country or "").upper()
+    promotion_country = (
+        requested_promotion_country
+        or str(cfg.get("promotion_country") or "VN").upper()
+    )
     if is_kakao:
-        checkout_proxy, update_proxy = _kakao_proxy_chain(checkout_proxy, update_proxy)
-        channel_region = _proxy_country_hint(checkout_proxy) or cfg["provider_country"]
-        promotion_country = _proxy_country_hint(update_proxy) or promotion_country
+        checkout_proxy, update_proxy = _kakao_proxy_chain(
+            checkout_proxy,
+            update_proxy,
+            channel_region,
+            requested_promotion_country,
+        )
+        channel_region = channel_region or _proxy_country_hint(checkout_proxy) or cfg["provider_country"]
+        promotion_country = (
+            requested_promotion_country
+            or _proxy_country_hint(update_proxy)
+            or promotion_country
+        )
         if promotion_country not in tuple(cfg.get("promotion_countries") or ("VN",)):
             promotion_country = str(cfg.get("promotion_country") or "VN").upper()
         poll_seconds = int(cfg.get("poll_seconds") or 60)

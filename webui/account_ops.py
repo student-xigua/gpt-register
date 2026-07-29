@@ -444,6 +444,31 @@ def _kakao_approve_pool(
     return proxies
 
 
+def _working_approve_pool(
+    proxies: list[str],
+    country: str,
+    api_url: str,
+) -> list[str]:
+    """并行预检 approve 出口；账号密码节点失败时按国家切到 API。"""
+    candidates = [proxy for proxy in proxies if proxy]
+    if not candidates:
+        return proxies
+
+    def select(proxy: str) -> str:
+        return proxy_config.pick_working_proxy(
+            proxy,
+            attempts=2,
+            api_url=api_url,
+            country=country,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(KAKAO_APPROVE_WORKERS, len(candidates)),
+        thread_name_prefix="proxy-preflight",
+    ) as executor:
+        return list(executor.map(select, candidates))
+
+
 def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) -> str:
     """后台为账号提炼 UPI / Kakao 付款链接，成功后写入 extra_json.links。"""
     method = (method or "").strip().lower()
@@ -455,6 +480,15 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
 
     label = link_gen.METHODS[method]["label"]
     pools = db.get_proxy_pools()
+    proxy_country_config = db.get_proxy_country_config()["selected"]
+    checkout_country = proxy_country_config.get(
+        f"{method}_pool1", link_gen.METHODS[method]["country"],
+    )
+    promotion_country = proxy_country_config.get(
+        f"{method}_pool2",
+        str(link_gen.METHODS[method].get("promotion_country") or checkout_country),
+    )
+    api_proxy_url = db.get_api_proxy_url()
     pool1 = pools.get(f"{method}_pool1", "")
     pool2 = pools.get(f"{method}_pool2", "")
     pool1_lines = _pool_lines(pool1)
@@ -501,19 +535,31 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                     # 账单 KR 与 JP/VN 促销必须使用独立 sticky SID。部分代理商会按
                     # SID 而不是「国家 + SID」绑定出口；若共用 SID，先建立的 KR
                     # 会话会把后续 JP/VN 请求也粘到 KR，导致促销预检直接失败。
-                    checkout_sid = (
+                    checkout_candidate = _materialize_proxy_template(
+                        checkout_template,
                         _new_kakao_proxy_sid()
-                        if KAKAO_PROXY_SID_PLACEHOLDER in checkout_template
-                        else ""
+                        if KAKAO_PROXY_SID_PLACEHOLDER in checkout_template else "",
                     )
-                    promotion_sid = (
+                    update_candidate = _materialize_proxy_template(
+                        update_template,
                         _new_kakao_proxy_sid()
-                        if KAKAO_PROXY_SID_PLACEHOLDER in update_template
-                        else ""
+                        if KAKAO_PROXY_SID_PLACEHOLDER in update_template else "",
                     )
-                    checkout_proxy = _materialize_proxy_template(checkout_template, checkout_sid)
-                    update_proxy = _materialize_proxy_template(update_template, promotion_sid)
-                    approve_pool = _kakao_approve_pool(pool1_lines, checkout_proxy)
+                    checkout_proxy = proxy_config.pick_working_proxy(
+                        checkout_candidate,
+                        api_url=api_proxy_url,
+                        country=checkout_country,
+                    )
+                    update_proxy = proxy_config.pick_working_proxy(
+                        update_candidate,
+                        api_url=api_proxy_url,
+                        country=promotion_country,
+                    )
+                    approve_pool = _working_approve_pool(
+                        _kakao_approve_pool(pool1_lines, checkout_proxy),
+                        checkout_country,
+                        api_proxy_url,
+                    )
                     if method == "kakao":
                         progress(
                             "attempt",
@@ -527,6 +573,8 @@ def start_link_gen(emails: list[str], method: str, *, poll_seconds: int = 35) ->
                         checkout_proxy=checkout_proxy,
                         update_proxy=update_proxy,
                         checkout_pool=approve_pool,
+                        checkout_country=checkout_country,
+                        promotion_country=promotion_country,
                         poll_seconds=poll_seconds,
                         approve_workers=KAKAO_APPROVE_WORKERS if method == "kakao" else 10,
                         log=progress,
